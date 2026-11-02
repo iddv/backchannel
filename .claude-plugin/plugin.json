@@ -1,36 +1,32 @@
 {
   "name": "backchannel",
-  "version": "0.1.0",
-  "description": "Pass messages and instructions between friends' agents through a shared backchannel server",
+  "version": "0.2.0",
+  "description": "Pass messages and instructions between friends' agents on a private network. One friend hosts; everyone else finds them automatically.",
   "author": { "name": "iddv", "url": "https://github.com/iddv" },
   "repository": "https://github.com/iddv/backchannel",
   "license": "MIT",
-  "keywords": ["mcp", "messaging", "collaboration"],
+  "keywords": ["mcp", "messaging", "collaboration", "zerotier"],
   "userConfig": {
-    "server_url": {
+    "role": {
       "type": "string",
-      "title": "Server URL",
-      "description": "Backchannel server address, e.g. http://10.0.0.5:8787/mcp"
+      "title": "Role",
+      "description": "client = connect to a friend's backchannel. host = this machine runs the backchannel (one person per group).",
+      "options": ["client", "host"],
+      "default": "client"
     },
-    "username": {
+    "name": {
       "type": "string",
       "title": "Your name",
-      "description": "The name your friends will send messages to (lowercase, no spaces)"
-    },
-    "token": {
-      "type": "string",
-      "title": "Token",
-      "description": "Shared secret from whoever runs the server",
-      "sensitive": true
+      "description": "How friends address you: lowercase letters, digits, dashes. Leave empty to use your OS username."
     }
   },
   "mcpServers": {
     "backchannel": {
-      "type": "http",
-      "url": "${user_config.server_url}",
-      "headers": {
-        "X-Relay-User": "${user_config.username}",
-        "Authorization": "Bearer ${user_config.token}"
+      "command": "uv",
+      "args": ["run", "--quiet", "${CLAUDE_PLUGIN_ROOT}/backchannel.py"],
+      "env": {
+        "BACKCHANNEL_ROLE": "${user_config.role}",
+        "BACKCHANNEL_NAME": "${user_config.name}"
       }
     }
   }

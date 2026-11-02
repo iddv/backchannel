@@ -1,100 +1,101 @@
 # backchannel
 
-A small [MCP](https://modelcontextprotocol.io) server that lets you and your friends' AI agents pass messages and instructions to each other.
+Pass messages and "try this" instructions between your and your friends' AI agents, over a private network you
+already share (ZeroTier, Tailscale, a LAN).
 
-Run it on one machine in a private network you all share (ZeroTier, Tailscale, a LAN, ...) and point every agent at it. It works with any MCP client that supports HTTP transport (Claude Code, Cursor, etc.).
+One friend **hosts**. Everyone else installs the same plugin as a **client**, and it finds the host on its own.
+The host gets a yes/no prompt the first time someone new connects. No URLs, tokens or config files.
 
-## Running the server
+> Status: early, developed in public. Linux and macOS. Expect breaking changes.
 
-Requires [uv](https://docs.astral.sh/uv/). Dependencies are declared inline in `server.py`.
+## Install (Claude Code)
 
-```bash
-RELAY_TOKEN=$(openssl rand -hex 16)   # share this with your friends
-RELAY_TOKEN=$RELAY_TOKEN uv run server.py
-```
-
-If your machine has a firewall, open the port on your private network interface only, e.g. with ufw:
-
-```bash
-sudo ufw allow in on <network-interface> to any port 8787 proto tcp
-```
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `RELAY_PORT` | `8787` | Port to listen on |
-| `RELAY_HOST` | `0.0.0.0` | Address to bind to (set to your private-network IP to restrict it) |
-| `RELAY_TOKEN` | *(unset)* | Shared secret; when set, clients must send `Authorization: Bearer <token>` |
-| `RELAY_DB` | `./backchannel.db` | SQLite file where messages are stored |
-
-### Or: let your own MCP client launch it
-
-If you host on the same machine you use your agent on, you can skip running it by hand. In `--stdio` mode
-your client starts the server, talks to it over stdio, and the same process hosts the HTTP relay for your
-friends while your client is open (if the port is already taken, e.g. by a second session, it just uses the
-shared database):
-
-```json
-"backchannel": {
-  "type": "stdio",
-  "command": "uv",
-  "args": ["run", "--quiet", "/path/to/backchannel/server.py", "--stdio"],
-  "env": { "RELAY_USER": "<your-name>", "RELAY_TOKEN": "<token>" }
-}
-```
-
-The relay is only reachable while that client session is running.
-
-## Connecting: Claude Code plugin (easiest)
-
-Inside Claude Code:
+Requires [uv](https://docs.astral.sh/uv/) and Claude Code 2.1.287 or later.
 
 ```
 /plugin install backchannel --marketplace iddv/backchannel
 ```
 
-(On versions before 2.1.275: `/plugin marketplace add iddv/backchannel`, then `/plugin install backchannel@backchannel`.)
+Pick a role when asked:
 
-It asks for the server URL (`http://<server-ip>:8787/mcp`), your name, and the token, which is stored in your
-system's secure credential store. Restart the session, then:
+- **host**: one person per group. Your machine stores and relays messages while your Claude Code session is open.
+- **client**: everyone else.
+
+Optionally set your name (defaults to your OS username). Then restart Claude Code, or run `/reload-plugins`.
+
+### Host: open the port
+
+Friends connect to you on TCP and UDP port 8787. If you use a firewall, allow it on your private network only:
+
+```bash
+# Linux (ufw), ZeroTier interfaces are named zt*
+sudo ufw allow in on zt+ to any port 8787
+```
+
+On macOS, allow incoming connections for `python` when the system asks.
+
+## Use
 
 | Command | What it does |
 |---|---|
-| `/backchannel:check` | Show new messages |
+| `/backchannel:check` | Show new messages. On the host, also asks about anyone waiting to join |
 | `/backchannel:send <name\|all> <message>` | Send a message |
 | `/backchannel:watch [interval]` | Keep checking every few minutes (default `3m`) for this session |
 | `/backchannel:stop` | Stop watching |
+| `/backchannel:peers` | Who's on the backchannel |
+| `/backchannel:status` | Your role, key and connection state. On the host, invite codes |
+| `/backchannel:join <ip or code>` | Connect to a host by address, if it isn't found automatically |
+| `/backchannel:remove <name>` | Host only: remove someone |
 
-You can also just talk to your agent: "check the backchannel", "tell sam to try X".
+You can also just talk to your agent: "check the backchannel", "tell sam to try bumping the timeout".
 
-If you host with the stdio config above *and* install the plugin, disable the plugin's own `backchannel` server
-in `/mcp` so you don't have two connections; the slash commands will use your stdio one.
+## How it works
 
-## Connecting: any MCP client
-
-Each person connects with their own name in the `X-Relay-User` header. For example, in Claude Code:
-
-```bash
-claude mcp add --scope user --transport http backchannel http://<server-ip>:8787/mcp \
-  --header "X-Relay-User: <your-name>" \
-  --header "Authorization: Bearer <token>"
+```
+friend's Claude ─stdio─▶ backchannel.py (client) ──signed HTTP──▶ backchannel.py (host) ◀─stdio─ host's Claude
+                                  └──── UDP broadcast "who hosts?" ────┘
 ```
 
-Then just ask your agent: "check the backchannel", "tell sam to pull main and rerun the tests", "tell everyone I'm deploying".
+- Everyone runs `backchannel.py` locally as a stdio MCP server; MCP never crosses the network.
+- Each device gets an Ed25519 key on first run (stored in the plugin's data directory). A key's short fingerprint,
+  like `7B3K-Q2XF`, is what the host sees in the join prompt.
+- **Discovery:** a client broadcasts on each private network it's on; the host replies with a signed hello. If
+  broadcast is blocked, it scans its /24 networks, and `/backchannel:join` is the manual fallback.
+- **Pairing:** a new client automatically asks to join. The host is asked "sam wants to join, key 9F2A-LMQ3. Let
+  them join?" A name belongs to one key: a different key using a known name is flagged `NEW KEY`.
+- **Every request is signed** (method, path, timestamp, nonce and body hash). The host rejects unsigned, stale or
+  replayed requests and anyone it hasn't accepted.
+- Messages are kept for 14 days (up to 5,000).
 
-## Tools
+### Headless host (homelab)
 
-| Tool | What it does |
-|---|---|
-| `send_message(to, message)` | Sends a message to one user, or to `all` |
-| `check_messages()` | Returns unread messages and marks them read |
-| `history(limit, with_user)` | Shows recent messages you can see |
-| `list_users()` | Lists who has connected and when they were last seen |
+```bash
+uv run backchannel.py serve                      # run the host without Claude Code (e.g. under systemd)
+uv run backchannel.py peers                      # list peers and pending requests
+uv run backchannel.py peers accept <fingerprint>
+uv run backchannel.py peers revoke <name|fingerprint>
+uv run backchannel.py status                     # key and invite codes
+```
+
+Set `BACKCHANNEL_NAME` and `BACKCHANNEL_DATA` in the environment as needed. Everyone, including you, then uses
+the `client` role.
 
 ## Security notes
 
-- This is meant for a small group of friends on a private network. Don't expose it to the public internet.
-- Names come from a header and aren't verified, so anyone with the token can claim any name.
-- Messages are other people's input. The tool descriptions tell agents to show instructions to their user instead of running them automatically, but it's up to your client's permission settings to enforce that.
+- **Messages are other people's words going into your agent.** The server tells agents to show messages verbatim
+  and to get your go-ahead before acting on anything in them, but your Claude Code permission prompts are the
+  real safety net. Don't use `--dangerously-skip-permissions` or broad auto-allow rules while `/backchannel:watch`
+  is running.
+- It's meant for a small group on a private network. The host only accepts connections from private addresses;
+  don't expose it to the internet.
+- There's no TLS: ZeroTier/Tailscale already encrypt traffic between members, and requests are signed.
+- The host can read everything and is trusted by design.
+
+## Development
+
+```bash
+uv run tests/e2e.py      # starts a host and two clients on port 18787 and runs the full flow
+```
 
 ## License
 
