@@ -1,0 +1,37 @@
+{
+  "name": "backchannel",
+  "version": "0.1.0",
+  "description": "Pass messages and instructions between friends' agents through a shared backchannel server",
+  "author": { "name": "iddv", "url": "https://github.com/iddv" },
+  "repository": "https://github.com/iddv/backchannel",
+  "license": "MIT",
+  "keywords": ["mcp", "messaging", "collaboration"],
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "Backchannel server address, e.g. http://10.0.0.5:8787/mcp"
+    },
+    "username": {
+      "type": "string",
+      "title": "Your name",
+      "description": "The name your friends will send messages to (lowercase, no spaces)"
+    },
+    "token": {
+      "type": "string",
+      "title": "Token",
+      "description": "Shared secret from whoever runs the server",
+      "sensitive": true
+    }
+  },
+  "mcpServers": {
+    "backchannel": {
+      "type": "http",
+      "url": "${user_config.server_url}",
+      "headers": {
+        "X-Relay-User": "${user_config.username}",
+        "Authorization": "Bearer ${user_config.token}"
+      }
+    }
+  }
+}

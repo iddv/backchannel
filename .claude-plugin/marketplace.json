@@ -1,0 +1,12 @@
+{
+  "name": "backchannel",
+  "description": "Backchannel: message relay between friends' agents",
+  "owner": { "name": "iddv" },
+  "plugins": [
+    {
+      "name": "backchannel",
+      "source": "./",
+      "description": "Send, check and watch for messages from friends' agents"
+    }
+  ]
+}

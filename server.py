@@ -10,10 +10,13 @@ Each client identifies itself with an `X-Relay-User` header and (optionally)
 proves membership with `Authorization: Bearer <RELAY_TOKEN>`.
 """
 import os
+import socket
 import sqlite3
+import sys
 import time
 from datetime import datetime
 
+import anyio
 from mcp.server.fastmcp import Context, FastMCP
 
 HOST = os.environ.get("RELAY_HOST", "0.0.0.0")
@@ -40,14 +43,22 @@ db.commit()
 mcp = FastMCP("backchannel", host=HOST, port=PORT)
 
 
+LOCAL_USER = os.environ.get("RELAY_USER", "").strip().lower()  # identity for the local stdio client
+
+
 def whoami(ctx: Context) -> str:
     req = ctx.request_context.request
-    headers = req.headers if req is not None else {}
-    if TOKEN and headers.get("authorization", "") != f"Bearer {TOKEN}":
-        raise PermissionError("Bad or missing relay token.")
-    user = (headers.get("x-relay-user") or "").strip().lower()
-    if not user:
-        raise PermissionError("Missing X-Relay-User header; reconnect with --header 'X-Relay-User: <name>'.")
+    if req is None:  # stdio: the host's own agent, launched locally
+        if not LOCAL_USER:
+            raise PermissionError("Set RELAY_USER in the MCP config env to use stdio mode.")
+        user = LOCAL_USER
+    else:
+        headers = req.headers
+        if TOKEN and headers.get("authorization", "") != f"Bearer {TOKEN}":
+            raise PermissionError("Bad or missing relay token.")
+        user = (headers.get("x-relay-user") or "").strip().lower()
+        if not user:
+            raise PermissionError("Missing X-Relay-User header; reconnect with --header 'X-Relay-User: <name>'.")
     db.execute(
         "INSERT INTO users(user,last_seen) VALUES(?,?) ON CONFLICT(user) DO UPDATE SET last_seen=excluded.last_seen",
         (user, time.time()),
@@ -127,6 +138,36 @@ def list_users(ctx: Context) -> str:
     ) or "No users yet."
 
 
+def port_free() -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((HOST, PORT))
+            return True
+        except OSError:
+            return False
+
+
+async def run_stdio_and_host() -> None:
+    """Serve the local agent over stdio, and host the HTTP relay for friends while we're alive
+    (unless another process, e.g. a second local session, already hosts it)."""
+    async with anyio.create_task_group() as tg:
+        if port_free():
+            log(f"hosting http://{HOST}:{PORT}/mcp (token {'ON' if TOKEN else 'OFF'}, db {DB_PATH})")
+            tg.start_soon(mcp.run_streamable_http_async)
+        else:
+            log(f"port {PORT} already in use; assuming another process hosts the relay")
+        await mcp.run_stdio_async()
+        tg.cancel_scope.cancel()
+
+
+def log(msg: str) -> None:
+    print(f"backchannel: {msg}", file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
-    print(f"backchannel on http://{HOST}:{PORT}/mcp  (token {'ON' if TOKEN else 'OFF'}, db {DB_PATH})")
-    mcp.run(transport="streamable-http")
+    if "--stdio" in sys.argv:
+        anyio.run(run_stdio_and_host)
+    else:
+        log(f"on http://{HOST}:{PORT}/mcp (token {'ON' if TOKEN else 'OFF'}, db {DB_PATH})")
+        mcp.run(transport="streamable-http")

@@ -26,7 +26,50 @@ sudo ufw allow in on <network-interface> to any port 8787 proto tcp
 | `RELAY_TOKEN` | *(unset)* | Shared secret; when set, clients must send `Authorization: Bearer <token>` |
 | `RELAY_DB` | `./backchannel.db` | SQLite file where messages are stored |
 
-## Connecting a client
+### Or: let your own MCP client launch it
+
+If you host on the same machine you use your agent on, you can skip running it by hand. In `--stdio` mode
+your client starts the server, talks to it over stdio, and the same process hosts the HTTP relay for your
+friends while your client is open (if the port is already taken, e.g. by a second session, it just uses the
+shared database):
+
+```json
+"backchannel": {
+  "type": "stdio",
+  "command": "uv",
+  "args": ["run", "--quiet", "/path/to/backchannel/server.py", "--stdio"],
+  "env": { "RELAY_USER": "<your-name>", "RELAY_TOKEN": "<token>" }
+}
+```
+
+The relay is only reachable while that client session is running.
+
+## Connecting: Claude Code plugin (easiest)
+
+Inside Claude Code:
+
+```
+/plugin install backchannel --marketplace iddv/backchannel
+```
+
+(On versions before 2.1.275: `/plugin marketplace add iddv/backchannel`, then `/plugin install backchannel@backchannel`.)
+
+It asks for the server URL (`http://<server-ip>:8787/mcp`), your name, and the token, which is stored in your
+system's secure credential store. Restart the session, then:
+
+| Command | What it does |
+|---|---|
+| `/backchannel:check` | Show new messages |
+| `/backchannel:send <name\|all> <message>` | Send a message |
+| `/backchannel:watch [interval]` | Keep checking every few minutes (default `3m`) for this session |
+| `/backchannel:stop` | Stop watching |
+
+You can also just talk to your agent: "check the backchannel", "tell sam to try X".
+
+If you host with the stdio config above *and* install the plugin, disable the plugin's own `backchannel` server
+in `/mcp` so you don't have two connections; the slash commands will use your stdio one.
+
+## Connecting: any MCP client
 
 Each person connects with their own name in the `X-Relay-User` header. For example, in Claude Code:
 
