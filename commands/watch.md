@@ -7,4 +7,5 @@ Start watching the backchannel for this session.
 Use the Skill tool to invoke the `loop` skill with args: `<interval> /backchannel:check`,
 where `<interval>` is "$ARGUMENTS" if given, otherwise `3m`.
 
-Then tell the user in one line that you're watching, and that `/backchannel:stop` turns it off.
+Then tell the user in one line that you're watching, that `/backchannel:stop` turns it off, and that messages are
+only shown, never acted on, without their go-ahead.

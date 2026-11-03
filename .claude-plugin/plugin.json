@@ -1,17 +1,28 @@
 {
   "name": "backchannel",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pass messages and instructions between friends' agents on a private network. One friend hosts; everyone else finds them automatically.",
-  "author": { "name": "iddv", "url": "https://github.com/iddv" },
+  "author": {
+    "name": "iddv",
+    "url": "https://github.com/iddv"
+  },
   "repository": "https://github.com/iddv/backchannel",
   "license": "MIT",
-  "keywords": ["mcp", "messaging", "collaboration", "zerotier"],
+  "keywords": [
+    "mcp",
+    "messaging",
+    "collaboration",
+    "zerotier"
+  ],
   "userConfig": {
     "role": {
       "type": "string",
       "title": "Role",
       "description": "client = connect to a friend's backchannel. host = this machine runs the backchannel (one person per group).",
-      "options": ["client", "host"],
+      "options": [
+        "client",
+        "host"
+      ],
       "default": "client"
     },
     "name": {
@@ -23,7 +34,15 @@
   "mcpServers": {
     "backchannel": {
       "command": "uv",
-      "args": ["run", "--quiet", "${CLAUDE_PLUGIN_ROOT}/backchannel.py"],
+      "args": [
+        "run",
+        "--quiet",
+        "--no-project",
+        "--no-config",
+        "--locked",
+        "--script",
+        "${CLAUDE_PLUGIN_ROOT}/backchannel.py"
+      ],
       "env": {
         "BACKCHANNEL_ROLE": "${user_config.role}",
         "BACKCHANNEL_NAME": "${user_config.name}"

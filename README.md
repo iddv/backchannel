@@ -4,7 +4,7 @@ Pass messages and "try this" instructions between your and your friends' AI agen
 already share (ZeroTier, Tailscale, a LAN).
 
 One friend **hosts**. Everyone else installs the same plugin as a **client**, and it finds the host on its own.
-The host gets a yes/no prompt the first time someone new connects. No URLs, tokens or config files.
+You confirm the host once, the host approves you once, and that's it. No URLs, tokens or config files.
 
 > Status: early, developed in public. Linux and macOS. Expect breaking changes.
 
@@ -28,7 +28,7 @@ Optionally set your name (defaults to your OS username). Then restart Claude Cod
 Friends connect to you on TCP and UDP port 8787. If you use a firewall, allow it on your private network only:
 
 ```bash
-# Linux (ufw), ZeroTier interfaces are named zt*
+# Linux (ufw), ZeroTier interfaces are named zt*; Tailscale needs no rule
 sudo ufw allow in on zt+ to any port 8787
 ```
 
@@ -57,45 +57,53 @@ friend's Claude ─stdio─▶ backchannel.py (client) ──signed HTTP──�
 ```
 
 - Everyone runs `backchannel.py` locally as a stdio MCP server; MCP never crosses the network.
-- Each device gets an Ed25519 key on first run (stored in the plugin's data directory). A key's short fingerprint,
-  like `7B3K-Q2XF`, is what the host sees in the join prompt.
-- **Discovery:** a client broadcasts on each private network it's on; the host replies with a signed hello. If
-  broadcast is blocked, it scans its /24 networks, and `/backchannel:join` is the manual fallback.
-- **Pairing:** a new client automatically asks to join. The host is asked "sam wants to join, key 9F2A-LMQ3. Let
-  them join?" A name belongs to one key: a different key using a known name is flagged `NEW KEY`.
-- **Every request is signed** (method, path, timestamp, nonce and body hash). The host rejects unsigned, stale or
-  replayed requests and anyone it hasn't accepted.
-- Messages are kept for 14 days (up to 5,000).
+- Each device gets an Ed25519 key on first run (stored in the plugin's data directory). Its fingerprint, like
+  `7B3K-Q2XF-M4PA-LW9C`, is what the other side sees.
+- **Discovery:** a client broadcasts on each private network it's on, and the host replies with a signed hello.
+  If that finds nothing, it asks Tailscale for online peers and scans its /24 networks. `/backchannel:join` with
+  an invite code is the manual fallback.
+- **First contact:** the client asks you "found iddv at 10.x.x.x, host key …, connect?" before trusting a host.
+  An invite code skips this, because it already contains the host's fingerprint.
+- **Pairing:** the client asks to join, and the host is asked "sam wants to join, key …. Let them join?" A name
+  belongs to one key: a different key using a known name is flagged `NEW KEY`. A declined key can't ask again.
+- **Everything is signed.** Requests are bound to the host, its current run, a timestamp and a nonce, and every
+  reply is signed by the host key you pinned.
+- New members start with an empty inbox. Messages are kept for 14 days (up to 5,000), and each check shows up to
+  20 at a time.
 
 ### Headless host (homelab)
 
 ```bash
-uv run backchannel.py serve                      # run the host without Claude Code (e.g. under systemd)
-uv run backchannel.py peers                      # list peers and pending requests
-uv run backchannel.py peers accept <fingerprint>
-uv run backchannel.py peers revoke <name|fingerprint>
-uv run backchannel.py status                     # key and invite codes
+uv run --locked --script backchannel.py serve                      # run the host without Claude Code (e.g. under systemd)
+uv run --locked --script backchannel.py peers                      # list peers and pending requests
+uv run --locked --script backchannel.py peers accept <fingerprint> <name>
+uv run --locked --script backchannel.py peers revoke <name|fingerprint>
+uv run --locked --script backchannel.py status                     # key and invite codes
 ```
 
 Set `BACKCHANNEL_NAME` and `BACKCHANNEL_DATA` in the environment as needed. Everyone, including you, then uses
 the `client` role.
 
-## Security notes
+## Security
 
-- **Messages are other people's words going into your agent.** The server tells agents to show messages verbatim
-  and to get your go-ahead before acting on anything in them, but your Claude Code permission prompts are the
-  real safety net. Don't use `--dangerously-skip-permissions` or broad auto-allow rules while `/backchannel:watch`
-  is running.
-- It's meant for a small group on a private network. The host only accepts connections from private addresses;
-  don't expose it to the internet.
-- There's no TLS: ZeroTier/Tailscale already encrypt traffic between members, and requests are signed.
+See [SECURITY.md](SECURITY.md) for the threat model, what's defended and what isn't, and how to report a
+vulnerability. In short:
+
+- **Messages are other people's words going into your agent.** backchannel marks clearly who wrote what, and your agent
+  checks with you before acting on a request in one. Your permission prompts are the real safety net: don't use `--dangerously-skip-permissions` while `/backchannel:watch` is running.
+- It's meant for a small group on a private network. Don't expose it to the internet.
+- Traffic is signed, not encrypted. Use ZeroTier or Tailscale (which encrypt) rather than a plain LAN.
 - The host can read everything and is trusted by design.
 
 ## Development
 
 ```bash
-uv run tests/e2e.py      # starts a host and two clients on port 18787 and runs the full flow
+uv run --no-project --no-config --locked --script tests/e2e.py   # host + clients on port 18787, plus attack tests
+uv lock --script backchannel.py                                   # after changing dependencies
 ```
+
+The host listens on ZeroTier/Tailscale interfaces when it finds them. Set `BACKCHANNEL_BIND=private` to listen on
+all private interfaces, or give a comma-separated list of IPs.
 
 ## License
 
