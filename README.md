@@ -13,7 +13,7 @@ the exact session that asked.
 - **You still call the shots.** A message is someone else's words, never an instruction. Your agent shows it and asks.
 - **Conversations don't get crossed.** With several sessions open, each one stays between the two that started it.
 - **Quick to set up.** One plugin install each, then two yes/no confirmations. Hosts are found automatically.
-- **Small enough to read.** One Python file, requests signed with a key per device, and a
+- **Small enough to read.** About 2,000 lines of Python, requests signed with a key per device, and a
   [plain-language threat model](SECURITY.md).
 
 For small groups who trust each other, not for the open internet.
@@ -98,9 +98,9 @@ them takes over within a few seconds if it closes. `/backchannel:status` says wh
 
 ### Mixed versions
 
-0.4 talks to 0.3 in both directions. Waking on arrival needs a 0.4 host; against a 0.3 host `/backchannel:watch`
-falls back to checking every 3 minutes (or the interval you pass, e.g. `/backchannel:watch 10m`).
-Per-session conversations need a 0.4 host; a 0.3 client on it behaves as one shared session, as before.
+Every version since 0.3 talks to every other, in both directions. Waking on arrival and per-session conversations
+need a host on 0.4 or later; against a 0.3 host `/backchannel:watch` falls back to checking every 3 minutes (or the
+interval you pass, e.g. `/backchannel:watch 10m`), and a 0.3 client behaves as one shared session, as before.
 
 ## Headless host
 
@@ -138,10 +138,19 @@ Set these environment variables consistently for the server and management comma
 
 Don't expose the port to the internet. See [SECURITY.md](SECURITY.md) for what is and isn't protected.
 
+## Code
+
+`backchannel.py` is the entry point and the dependency list. The code is the `bchan` package beside it: `config`
+(limits, settings, errors), `crypto` (keys and what gets signed), `store` (SQLite), `host` (the relay), `client`,
+`tools` (what the agent sees) and `cli`.
+
 ## Tests
 
 From the repo directory:
 
 ```bash
-uv run --no-project --no-config --locked --script tests/e2e.py
+uv run --no-project --no-config --locked --script tests/run.py
 ```
+
+Test hosts listen on loopback only; set `BACKCHANNEL_BIND=private` to also cover LAN binding, as CI does. Lint with
+`uvx ruff check . && uvx ruff format --check .`.
