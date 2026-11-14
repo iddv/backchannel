@@ -363,6 +363,9 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=5)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
+        # with WAL this still can't corrupt the database; a power cut may lose the last moments. Without it every
+        # write waits for the disk (3 ms on a hard drive), several times per request.
+        self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(
             """
             CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -678,6 +681,7 @@ class Host:
         self.nets: list[ipaddress.IPv4Network] = []
         self.serving = False                  # is *this* process the one holding the port?
         self.waits: dict[str, int] = defaultdict(int)
+        self.bell: asyncio.Event | None = None  # rung on every send, so long-polls answer at once
         self.app = Starlette(routes=[
             Route("/hello", self.http_hello, methods=["GET"]),
             Route("/api/{op}", self.http_api, methods=["POST"]),
@@ -699,14 +703,19 @@ class Host:
             raise BCError(f"Rate limit: at most {SEND_PER_MINUTE} messages a minute.")
         if self.store.sent_since(sender, 86400) >= SEND_PER_DAY:
             raise BCError(f"Daily limit reached ({SEND_PER_DAY} messages).")
-        self.store.record_send(sender)
-        self.store.touch(sender, sid)
         # if this session is already in a conversation with one of their sessions, the message goes to that one;
         # if that session has closed, this starts a new conversation for whichever of their sessions reads it
         target = self.store.linked(sender, sid, to) if sid and to != "all" else ""
         if target and target not in self.store.live_sessions(to):
             target = ""
-        return f"Sent message #{self.store.add(sender, to, body, sid, target)} to {to}."
+        with self.store.tx():
+            self.store.record_send(sender)
+            self.store.touch(sender, sid)
+            msg_id = self.store.add(sender, to, body, sid, target)
+        if self.bell:
+            self.bell.set()
+            self.bell = None
+        return f"Sent message #{msg_id} to {to}."
 
     def peer_list(self) -> list[dict]:
         out = [{"name": self.name, "fp": self.ident.fp, "host": True}]
@@ -875,7 +884,10 @@ class Host:
                 w = self.store.waiting(name, data.get("after"), sid)
                 if w["unread"] or time.monotonic() >= deadline or not self.serving or await req.is_disconnected():
                     return self._signed(nonce, w)
-                await asyncio.sleep(1)
+                # woken at once by a send in this process; the timeout catches sends by another host session
+                self.bell = self.bell or asyncio.Event()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.bell.wait(), 1)
         finally:
             self.store.touch(name, sid, waiting=True)
             self.waits[key] -= 1
@@ -909,9 +921,12 @@ class Host:
         socks, bound = [], []
         try:
             for ip in ["127.0.0.1"] + [str(i.ip) for _, i in ifaces]:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # naming the protocol matters: asyncio only turns off Nagle's algorithm on sockets that do, and
+                # with it on every reply waits ~40 ms for the client's delayed ACK
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
                 socks.append(s)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.bind((ip, self.port))
                 s.listen(64)
                 s.setblocking(False)
@@ -1081,7 +1096,9 @@ class Client:
         """HTTP request whose reply is read with a hard size cap and an overall deadline, uncompressed, before
         anything is trusted: a fake host can't stream forever or send a decompression bomb."""
         async def go():
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False) as c:
+            # verify=False only skips loading the CA bundle (~20 ms per call): every URL here is plain http to a
+            # private address, and trust comes from the Ed25519 signatures, not TLS
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False, verify=False) as c:
                 headers = {**kw.pop("headers", {}), "accept-encoding": "identity"}
                 async with c.stream(method, url, headers=headers, **kw) as r:
                     if r.headers.get("content-encoding", "identity") != "identity":
@@ -1630,6 +1647,15 @@ async def run_stdio() -> None:
             task.cancel()
 
 
+def _launcher() -> tuple[int, int]:
+    """Who started this watcher: our parent (uv) and its parent (the agent's shell). If either changes, the
+    session that wanted the watch is gone and the watcher should stop rather than linger."""
+    parent = os.getppid()
+    with contextlib.suppress(psutil.Error):
+        return parent, psutil.Process(parent).ppid()
+    return parent, 0
+
+
 def _say(line: str) -> None:
     print(f"backchannel: {line}", flush=True)
 
@@ -1651,8 +1677,8 @@ async def wait_host() -> int:
                 write_private(told_file, json.dumps(now))
         return new
 
-    parent, first, touched = os.getppid(), True, -1e9
-    while os.getppid() == parent:
+    parent, first, touched = _launcher(), True, -1e9
+    while _launcher() == parent:
         if not first:
             await asyncio.sleep(2)
         first = False
@@ -1678,8 +1704,8 @@ async def wait_client() -> int:
     if not client.known():
         _say("not connected to a host yet, so there is nothing to watch. Run /backchannel:check first.")
         return 2
-    parent, delay, host = os.getppid(), 5, None
-    while os.getppid() == parent:
+    parent, delay, host = _launcher(), 5, None
+    while _launcher() == parent:
         try:
             host = host or await client.ensure_host(sweep=False)
             r = await client._post(host, "wait", {"after": client.seen(host["key"]), "timeout": WAIT_HOLD},

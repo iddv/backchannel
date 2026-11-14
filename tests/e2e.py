@@ -163,7 +163,11 @@ async def main():
     tmp = Path(tempfile.mkdtemp(prefix="bc-e2e-"))
     async with contextlib.AsyncExitStack() as stack:
         host = await Agent(stack, "host", "iddv", tmp / "host").start()
-        await asyncio.sleep(1.5)  # let the relay bind
+        for _ in range(100):  # let the relay bind; a busy machine can take a while
+            with contextlib.suppress(httpx.HTTPError):
+                host_hello()
+                break
+            await asyncio.sleep(0.2)
         sam = await Agent(stack, "client", "sam", tmp / "sam").start()
         bob = await Agent(stack, "client", "bob", tmp / "bob").start()
         host_fp = bc.fingerprint(host_hello()["key"])
