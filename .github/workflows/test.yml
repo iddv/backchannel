@@ -14,7 +14,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Check the lockfile is current
-        run: uv lock --script backchannel.py --check
+        run: |
+          uv lock --script backchannel.py --check
+          uv lock --script tests/e2e.py --check
       - name: End-to-end and attack tests
         run: uv run --no-project --no-config --locked --script tests/e2e.py
         env:

@@ -23,6 +23,7 @@ is signed by the host key the client pinned. MCP itself never goes over the netw
     uv run --locked --script backchannel.py serve     headless host (e.g. a homelab box)
     uv run --locked --script backchannel.py peers [accept <fingerprint> <name> | revoke <name|fingerprint>]
     uv run --locked --script backchannel.py status
+    uv run --locked --script backchannel.py wait      block until something new arrives, print one line, exit
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -83,6 +85,14 @@ NONCE_TTL = 300
 NONCE_MAX = 20_000
 RETENTION_DAYS = 14
 RETENTION_MAX = 5000
+WAIT_HOLD = 45                     # seconds one long-poll is held open
+WAIT_PER_PEER = 4                  # concurrent long-polls per key (one per watching session)
+WAIT_TOTAL = 32
+SCAN_EVERY = 600                   # at most one address sweep per process in this many seconds
+REBIND_EVERY = 15                  # how often the host looks for changed interfaces / a freed port
+SESSION_TTL = 1800                 # a session not heard from for this long no longer holds its conversations
+WATCHER_TTL = 180                  # ... or this long, if it was watching (watchers call in every WAIT_HOLD s)
+SID_RE = re.compile(r"[0-9a-f]{12}")
 OVERLAY_PREFIXES = ("zt", "feth", "tailscale")
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
@@ -97,6 +107,11 @@ def valid_name(n: object) -> bool:
     return isinstance(n, str) and bool(NAME_RE.fullmatch(n)) and n != "all" and not FP_LIKE_RE.fullmatch(n)
 
 
+def as_sid(v: object) -> str:
+    """A session id from the network, or '' (older clients have none and behave as one shared session)."""
+    return v if isinstance(v, str) and SID_RE.fullmatch(v) else ""
+
+
 def _norm_name(raw: str) -> str:
     n = re.sub(r"[^a-z0-9-]+", "-", raw.strip().lower()).strip("-")[:24]
     return n if valid_name(n) else "anon"
@@ -106,6 +121,8 @@ ROLE = _env("BACKCHANNEL_ROLE", "client").lower()
 NAME = _norm_name(_env("BACKCHANNEL_NAME", getpass.getuser()))
 PORT = int(_env("BACKCHANNEL_PORT", "8787"))
 BIND = _env("BACKCHANNEL_BIND", "overlay")  # overlay | private | comma-separated IPs
+# one id per Claude Code session (each session runs its own copy of this server); the watcher inherits it
+SESSION = _env("BACKCHANNEL_SESSION") if SID_RE.fullmatch(_env("BACKCHANNEL_SESSION")) else secrets.token_hex(6)
 DATA = Path(_env("BACKCHANNEL_DATA", _env("CLAUDE_PLUGIN_DATA", str(Path.home() / ".local/share/backchannel"))))
 
 
@@ -115,6 +132,10 @@ def log(msg: str) -> None:
 
 class BCError(Exception):
     """An error whose message is meant for the user."""
+
+
+class StaleHost(BCError):
+    """The host process changed between our hello and our request; a fresh hello fixes it."""
 
 
 def prepare_data_dir() -> None:
@@ -182,7 +203,15 @@ class Identity:
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            self.key = Ed25519PrivateKey.from_private_bytes(b64d(json.loads(path.read_text())["private"]))
+            for attempt in range(20):  # another session may be mid-way through writing it
+                try:
+                    raw = b64d(json.loads(path.read_text())["private"])
+                    break
+                except (ValueError, KeyError):
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.05)
+            self.key = Ed25519PrivateKey.from_private_bytes(raw)
         else:  # first run: we won the race to create it
             self.key = Ed25519PrivateKey.generate()
             raw = self.key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
@@ -360,6 +389,18 @@ class Store:
                         self.db.execute("UPDATE peers SET status='revoked' WHERE key=?", (key,))
                     seen.add(name)
                 self.db.execute("UPDATE peers SET fp=? WHERE key=?", (fingerprint(key), key))  # v0.2 used 40 bits
+            mcols = {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}
+            for col in ("sender_sid", "recipient_sid"):  # v0.3 databases; '' means "no particular session"
+                if col not in mcols:
+                    self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+            self.db.execute("CREATE TABLE IF NOT EXISTS sessions (user TEXT NOT NULL, sid TEXT NOT NULL, "
+                            "last_seen REAL NOT NULL, last_wait REAL NOT NULL DEFAULT 0, PRIMARY KEY(user, sid))")
+            # links: `user`'s session `sid` is in conversation with `peer`'s session `peer_sid`
+            self.db.execute("CREATE TABLE IF NOT EXISTS links (user TEXT NOT NULL, sid TEXT NOT NULL, peer TEXT NOT NULL, "
+                            "peer_sid TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(user, sid, peer))")
+            # readmarks: messages read out of order (another session's are still waiting below them)
+            self.db.execute("CREATE TABLE IF NOT EXISTS readmarks (user TEXT NOT NULL, msg_id INTEGER NOT NULL, "
+                            "PRIMARY KEY(user, msg_id))")
             self.db.execute("CREATE TABLE IF NOT EXISTS sends (sender TEXT NOT NULL, ts REAL NOT NULL)")
             self.db.execute("CREATE INDEX IF NOT EXISTS sends_sender_ts ON sends(sender, ts)")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_accepted_name ON peers(name) WHERE status='accepted'")
@@ -421,6 +462,9 @@ class Store:
             # a new member starts with an empty inbox and can't read what was sent before they joined
             self.db.execute("INSERT INTO cursors(user,last_id) VALUES(?,?) "
                             "ON CONFLICT(user) DO UPDATE SET last_id=excluded.last_id", (expected_name, top))
+            for q in ("DELETE FROM readmarks WHERE user=?", "DELETE FROM sessions WHERE user=?"):
+                self.db.execute(q, (expected_name,))
+            self.db.execute("DELETE FROM links WHERE user=? OR peer=?", (expected_name, expected_name))
         return True
 
     def revoke(self, key: str) -> None:
@@ -440,9 +484,10 @@ class Store:
         return r[0] if r else 0
 
     # messages
-    def add(self, sender: str, recipient: str, body: str) -> int:
-        return self.db.execute("INSERT INTO messages(ts,sender,recipient,body) VALUES(?,?,?,?)",
-                               (time.time(), sender, recipient, body)).lastrowid
+    def add(self, sender: str, recipient: str, body: str, sender_sid: str = "", recipient_sid: str = "") -> int:
+        return self.db.execute("INSERT INTO messages(ts,sender,recipient,body,sender_sid,recipient_sid) "
+                               "VALUES(?,?,?,?,?,?)",
+                               (time.time(), sender, recipient, body, sender_sid, recipient_sid)).lastrowid
 
     def sent_since(self, sender: str, seconds: float) -> int:
         """From a separate log, so pruning old messages can't reset anyone's daily quota."""
@@ -452,31 +497,109 @@ class Store:
     def record_send(self, sender: str) -> None:
         self.db.execute("INSERT INTO sends(sender,ts) VALUES(?,?)", (sender, time.time()))
 
+    # sessions: a person can have several agent sessions open. A conversation locks to the two sessions in it:
+    # the one that sent the first message and the one that first read it. Replies then go only to those two.
+    def touch(self, user: str, sid: str, waiting: bool = False) -> None:
+        if sid:
+            now = time.time()
+            self.db.execute("INSERT INTO sessions(user,sid,last_seen,last_wait) VALUES(?,?,?,?) ON CONFLICT(user,sid) "
+                            "DO UPDATE SET last_seen=excluded.last_seen, last_wait=MAX(last_wait, excluded.last_wait)",
+                            (user, sid, now, now if waiting else 0))
+
+    def live_sessions(self, user: str) -> list[str]:
+        """Sessions still around to receive what's addressed to them. A watcher that goes quiet is gone quickly;
+        a session that only checks by hand gets the benefit of the doubt for longer."""
+        now = time.time()
+        return [r[0] for r in self.db.execute(
+            "SELECT sid FROM sessions WHERE user=? AND last_seen > CASE WHEN last_seen-last_wait < ? THEN ? ELSE ? END",
+            (user, WATCHER_TTL, now - WATCHER_TTL, now - SESSION_TTL))]
+
+    def linked(self, user: str, sid: str, peer: str) -> str:
+        r = self.db.execute("SELECT peer_sid FROM links WHERE user=? AND sid=? AND peer=?", (user, sid, peer)).fetchone()
+        return r[0] if r else ""
+
+    def link(self, user: str, sid: str, peer: str, peer_sid: str) -> None:
+        for a in ((user, sid, peer, peer_sid), (peer, peer_sid, user, sid)):
+            self.db.execute("INSERT INTO links(user,sid,peer,peer_sid,updated) VALUES(?,?,?,?,?) ON CONFLICT(user,sid,peer) "
+                            "DO UPDATE SET peer_sid=excluded.peer_sid, updated=excluded.updated", (*a, time.time()))
+
     def _cursor(self, user: str) -> int:
         r = self.db.execute("SELECT last_id FROM cursors WHERE user=?", (user,)).fetchone()
         return max(r[0] if r else 0, self.joined_id(user))
 
-    _UNREAD = "WHERE id>? AND (recipient=? OR recipient='all') AND sender!=?"
+    def _unread(self, user: str, sid: str = "", after: int = 0) -> tuple[str, list]:
+        """WHERE clause for what `user` hasn't read. With a session id, leave out messages that belong to another
+        of their sessions, unless that session has gone away. Without one (v0.3 clients), everything for the name."""
+        where = ("WHERE id>? AND (recipient=? OR recipient='all') AND sender!=? "
+                 "AND id NOT IN (SELECT msg_id FROM readmarks WHERE user=?)")
+        args: list = [max(self._cursor(user), after), user, user, user]
+        if sid:
+            live = [x for x in self.live_sessions(user) if x != sid]
+            where += f" AND (recipient='all' OR recipient_sid IN ('',?) OR recipient_sid NOT IN ({','.join('?' * len(live))}))"
+            args += [sid, *live]
+        return where, args
 
-    def unread(self, user: str) -> tuple[list[dict], int]:
-        """Up to CHECK_MAX_MESSAGES / CHECK_MAX_BYTES new messages, and how many more remain."""
-        last = self._cursor(user)
+    def _mark(self, user: str, ids: list[int]) -> None:
+        """Mark messages read, then move the cursor up to just below the oldest one still unread by anyone."""
+        self.db.executemany("INSERT OR IGNORE INTO readmarks(user,msg_id) VALUES(?,?)", [(user, i) for i in ids])
+        where, args = self._unread(user)
+        low = self.db.execute(f"SELECT MIN(id) FROM messages {where}", args).fetchone()[0]
+        top = self.db.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
+        new = low - 1 if low else top
+        self.db.execute("INSERT INTO cursors(user,last_id) VALUES(?,?) "
+                        "ON CONFLICT(user) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)", (user, new))
+        self.db.execute("DELETE FROM readmarks WHERE user=? AND msg_id<=?", (user, new))
+
+    def ack(self, user: str, upto: object, sid: str = "") -> None:
+        """Mark as read everything this session could see up to message id `upto`."""
+        if not isinstance(upto, int) or isinstance(upto, bool) or upto <= 0:
+            return
+        where, args = self._unread(user, sid)
+        ids = [r[0] for r in self.db.execute(f"SELECT id FROM messages {where} AND id<=?", (*args, upto))]
+        if ids:
+            with self.tx():
+                self._mark(user, ids)
+
+    def waiting(self, user: str, after: object = 0, sid: str = "") -> dict:
+        """What's unread for this session beyond message id `after`, without marking anything read."""
+        after = after if isinstance(after, int) and not isinstance(after, bool) else 0
+        where, args = self._unread(user, sid, after)
+        rows = self.db.execute(f"SELECT id,sender FROM messages {where} ORDER BY id LIMIT 200", args).fetchall()
+        return {"unread": len(rows), "latest": rows[-1][0] if rows else 0,
+                "from": sorted({r[1] for r in rows if valid_name(r[1])})[:10]}
+
+    def unread(self, user: str, hold: bool = False, sid: str = "") -> tuple[list[dict], int]:
+        """Up to CHECK_MAX_MESSAGES / CHECK_MAX_BYTES new messages, and how many more remain. With `hold` they
+        stay unread until the reader acknowledges them, so a reply lost on the way isn't lost for good. Reading a
+        direct message claims it: that conversation now belongs to this session and the sender's."""
+        self.touch(user, sid)
+        where, args = self._unread(user, sid)
         rows, size = [], 0
-        for m in self._rows(self._UNREAD + " ORDER BY id LIMIT ?", (last, user, user, CHECK_MAX_MESSAGES)):
+        for m in self._rows(where + " ORDER BY id LIMIT ?", (*args, CHECK_MAX_MESSAGES)):
             size += len(m["body"].encode())
             if rows and size > CHECK_MAX_BYTES:
                 break
             rows.append(m)
-        if rows:
-            self.db.execute("INSERT INTO cursors(user,last_id) VALUES(?,?) "
-                            "ON CONFLICT(user) DO UPDATE SET last_id=excluded.last_id", (user, rows[-1]["id"]))
-            last = rows[-1]["id"]
-        more = self.db.execute(f"SELECT COUNT(*) FROM messages {self._UNREAD}", (last, user, user)).fetchone()[0]
-        return rows, more
+        with self.tx():
+            for m in rows:
+                ssid, rsid = self.db.execute("SELECT sender_sid,recipient_sid FROM messages WHERE id=?",
+                                             (m["id"],)).fetchone()
+                if sid and m["recipient"] == user and rsid != sid:
+                    self.db.execute("UPDATE messages SET recipient_sid=? WHERE id=?", (sid, m["id"]))
+                    if ssid:
+                        self.link(user, sid, m["sender"], ssid)
+                        # and anything else that session already sent, beyond this page
+                        self.db.execute("UPDATE messages SET recipient_sid=? WHERE recipient=? AND sender=? AND "
+                                        "sender_sid=? AND recipient_sid='' AND id>?", (sid, user, m["sender"], ssid, m["id"]))
+            if rows and not hold:
+                self._mark(user, [m["id"] for m in rows])
+        where, args = self._unread(user, sid)  # the cursor may have moved
+        total = self.db.execute(f"SELECT COUNT(*) FROM messages {where}", args).fetchone()[0]
+        return rows, total - (len(rows) if hold else 0)
 
-    def unread_count(self, user: str) -> int:
-        return self.db.execute(f"SELECT COUNT(*) FROM messages {self._UNREAD}",
-                               (self._cursor(user), user, user)).fetchone()[0]
+    def unread_count(self, user: str, sid: str = "") -> int:
+        where, args = self._unread(user, sid)
+        return self.db.execute(f"SELECT COUNT(*) FROM messages {where}", args).fetchone()[0]
 
     def history(self, user: str, limit: int, with_user: str | None) -> list[dict]:
         where, a = "WHERE id>? AND (recipient=? OR recipient='all' OR sender=?)", [self.joined_id(user), user, user]
@@ -495,6 +618,9 @@ class Store:
         self.db.execute("DELETE FROM messages WHERE ts<?", (time.time() - RETENTION_DAYS * 86400,))
         self.db.execute("DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?)",
                         (RETENTION_MAX,))
+        self.db.execute("DELETE FROM readmarks WHERE msg_id < (SELECT COALESCE(MIN(id),0) FROM messages)")
+        self.db.execute("DELETE FROM sessions WHERE last_seen<?", (time.time() - 86400,))
+        self.db.execute("DELETE FROM links WHERE updated<?", (time.time() - RETENTION_DAYS * 86400,))
 
 
 def describe_request(store: Store, p: Peer) -> str:
@@ -535,6 +661,8 @@ class Host:
         self.nonces = NonceCache()
         self.stranger_nonces = NonceCache(limit=2_000)
         self.nets: list[ipaddress.IPv4Network] = []
+        self.serving = False                  # is *this* process the one holding the port?
+        self.waits: dict[str, int] = defaultdict(int)
         self.app = Starlette(routes=[
             Route("/hello", self.http_hello, methods=["GET"]),
             Route("/api/{op}", self.http_api, methods=["POST"]),
@@ -544,7 +672,7 @@ class Host:
     def known_names(self) -> set[str]:
         return self.store.accepted_names() | {self.name}
 
-    def send(self, sender: str, to: str, body: str) -> str:
+    def send(self, sender: str, to: str, body: str, sid: str = "") -> str:
         to = to.strip().lower()
         if to != "all" and to not in self.known_names():
             raise BCError(f"Unknown recipient '{clean(to, 30)}'. Known: all, {', '.join(sorted(self.known_names()))}.")
@@ -557,7 +685,10 @@ class Host:
         if self.store.sent_since(sender, 86400) >= SEND_PER_DAY:
             raise BCError(f"Daily limit reached ({SEND_PER_DAY} messages).")
         self.store.record_send(sender)
-        return f"Sent message #{self.store.add(sender, to, body)} to {to}."
+        self.store.touch(sender, sid)
+        # if this session is already in a conversation with one of their sessions, the message goes to that one
+        target = self.store.linked(sender, sid, to) if sid and to != "all" else ""
+        return f"Sent message #{self.store.add(sender, to, body, sid, target)} to {to}."
 
     def peer_list(self) -> list[dict]:
         out = [{"name": self.name, "fp": self.ident.fp, "host": True}]
@@ -677,12 +808,19 @@ class Host:
                 return self._signed(nonce, {"error": "declined"}, 403)
             if peer.status != "accepted":
                 return self._signed(nonce, {"error": "pending"}, 401)
+            sid = as_sid(data.get("sid"))
             if op == "send":
                 return self._signed(nonce, {"result": self.send(peer.name, str(data.get("to", "")),
-                                                                str(data.get("body", "")))})
-            if op == "check":
-                rows, more = self.store.unread(peer.name)
+                                                                str(data.get("body", "")), sid)})
+            if op == "check":  # v0.3 clients send {} and are marked read at once; newer ones hold and ack
+                self.store.ack(peer.name, data.get("ack"), sid)
+                rows, more = self.store.unread(peer.name, hold=data.get("hold") is True, sid=sid)
                 return self._signed(nonce, {"messages": rows, "more": more})
+            if op == "ack":
+                self.store.ack(peer.name, data.get("id"), sid)
+                return self._signed(nonce, {"ok": True})
+            if op == "wait":
+                return await self._wait(req, nonce, key, peer.name, data, sid)
             if op == "history":
                 w = data.get("with")
                 rows = self.store.history(peer.name, int(data.get("limit", 20)), str(w).lower() if w else None)
@@ -694,6 +832,33 @@ class Host:
         except (TypeError, ValueError, OverflowError):
             return self._signed(nonce, {"error": "bad_request"}, 400)
         return self._signed(nonce, {"error": "unknown_op"}, 404)
+
+    async def _wait(self, req: Request, nonce: str, key: str, name: str, data: dict, sid: str = "") -> Response:
+        """Long-poll: answer as soon as `name` has unread messages newer than `after`, or after WAIT_HOLD seconds.
+        Nothing is marked read. This is what lets a watching agent sleep instead of polling."""
+        if self.waits[key] >= WAIT_PER_PEER or sum(self.waits.values()) >= WAIT_TOTAL:
+            return self._signed(nonce, {"error": "too_many_waits"}, 429)
+        hold = data.get("timeout", WAIT_HOLD)
+        hold = min(max(hold, 0), WAIT_HOLD) if isinstance(hold, (int, float)) and hold == hold else WAIT_HOLD
+        deadline, touched = time.monotonic() + hold, -1e9
+        self.waits[key] += 1
+        try:
+            while True:
+                peer = self.store.peer(key)
+                if not peer or peer.status != "accepted" or peer.name != name:
+                    return self._signed(nonce, {"error": "declined"}, 403)
+                if time.monotonic() >= touched + 20:
+                    touched = time.monotonic()
+                    self.store.touch(name, sid, waiting=True)
+                w = self.store.waiting(name, data.get("after"), sid)
+                if w["unread"] or time.monotonic() >= deadline or not self.serving or await req.is_disconnected():
+                    return self._signed(nonce, w)
+                await asyncio.sleep(1)
+        finally:
+            self.store.touch(name, sid, waiting=True)
+            self.waits[key] -= 1
+            if self.waits[key] <= 0:
+                self.waits.pop(key, None)
 
     def _pair(self, nonce: str, key: str, peer: Peer | None, data: dict, ip: str) -> Response:
         if peer and peer.status == "accepted":
@@ -736,6 +901,24 @@ class Host:
         return socks, bound
 
     async def serve(self, install_signal_handlers: bool) -> None:
+        """Hold the relay port for as long as this process lives. If another session on this machine already has
+        it, keep trying so this one takes over when that one ends; if the network interfaces change (overlay came
+        up, laptop woke with a new address), re-listen on the new set."""
+        told = False
+        while True:
+            try:
+                if not await self._serve_once(install_signal_handlers):
+                    return
+                told = False
+            except OSError as e:
+                if not told:
+                    log(f"port {self.port} is busy ({e.strerror}); another backchannel session on this machine is "
+                        f"probably hosting. This one will take over if that one stops.")
+                    told = True
+            await asyncio.sleep(5 if told else 1)
+
+    async def _serve_once(self, install_signal_handlers: bool) -> bool:
+        """Serve until the interface set changes (returns True: serve again) or the server is told to stop."""
         socks, bound = self._sockets()  # raises OSError if the port is taken
         loop = asyncio.get_running_loop()
         host = self
@@ -761,24 +944,42 @@ class Host:
                 s.close()
             raise
         config = uvicorn.Config(self.app, http=GuardedH11, log_level="warning", lifespan="off", proxy_headers=False,
-                                limit_concurrency=64, timeout_keep_alive=5, server_header=False, date_header=False)
+                                limit_concurrency=64, timeout_keep_alive=5, server_header=False, date_header=False,
+                                timeout_graceful_shutdown=2)
         server = uvicorn.Server(config)
         if not install_signal_handlers:
             server.capture_signals = contextlib.nullcontext  # let the stdio side own process lifetime
 
+        rebind = False
+
         async def maintenance():
+            nonlocal rebind
+            ticks = 0
             while True:
+                if ticks % max(1, 300 // REBIND_EVERY) == 0:
+                    with contextlib.suppress(Exception):
+                        self.maintain()
+                ticks += 1
+                await asyncio.sleep(REBIND_EVERY)
                 with contextlib.suppress(Exception):
-                    self.maintain()
-                await asyncio.sleep(300)
+                    if sorted(str(i.ip) for _, i in bind_interfaces()) != sorted(bound[1:]):
+                        log("network interfaces changed; re-listening")
+                        rebind = server.should_exit = True
+                        return
 
         log(f"hosting as {self.name} (key {self.ident.fp}) on port {self.port}: {', '.join(bound)}")
         task = asyncio.create_task(maintenance())
+        self.serving = True
         try:
             await server.serve(sockets=socks)
         finally:
+            self.serving = False
             task.cancel()
             udp.close()
+            for s in socks:
+                with contextlib.suppress(OSError):
+                    s.close()
+        return rebind
 
 
 class GuardedH11(H11Protocol):
@@ -814,9 +1015,30 @@ class GuardedH11(H11Protocol):
 # ---------------------------------------------------------------- client
 
 class Client:
-    def __init__(self, ident: Identity, name: str, data_dir: Path, port: int):
-        self.ident, self.name, self.port = ident, name, port
+    def __init__(self, ident: Identity, name: str, data_dir: Path, port: int, sid: str = ""):
+        self.ident, self.name, self.port, self.sid = ident, name, port, sid
         self.hosts_file = data_dir / "known_host.json"
+        self.seen_file = data_dir / "seen.json"
+        self.last_scan = 0.0
+
+    def _seen(self, host_key: str) -> dict:
+        with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+            d = json.loads(self.seen_file.read_text())
+            if d.get("key") == host_key and isinstance(d.get("ids"), dict):
+                return {k: v for k, v in d["ids"].items() if isinstance(v, int)}
+        return {}
+
+    def seen(self, host_key: str) -> int:
+        """Highest message id this session has been shown by that host (the watcher process reads it too)."""
+        return self._seen(host_key).get(self.sid, 0)
+
+    def mark_seen(self, host_key: str, msg_id: int) -> None:
+        ids = self._seen(host_key)
+        if msg_id > ids.get(self.sid, 0):
+            ids.pop(self.sid, None)
+            ids[self.sid] = msg_id  # newest last; old sessions fall off the front
+            with contextlib.suppress(OSError):
+                write_private(self.seen_file, json.dumps({"key": host_key, "ids": dict(list(ids.items())[-32:])}))
 
     def known(self) -> dict | None:
         with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError, BCError):
@@ -923,9 +1145,9 @@ class Client:
             return []
         return ips[:254]
 
-    async def scan(self) -> list[dict]:
+    async def scan(self, subnets: bool = True) -> list[dict]:
         targets = [f"{ip}:{self.port}" for ip in self.tailscale_peers()]
-        for _, iface in private_interfaces():
+        for _, iface in private_interfaces() if subnets else []:
             if 24 <= iface.network.prefixlen < 31:
                 targets += [f"{h}:{self.port}" for h in iface.network.hosts()]
         sem = asyncio.Semaphore(128)
@@ -936,8 +1158,15 @@ class Client:
 
         return [r for r in await asyncio.gather(*(probe(a) for a in dict.fromkeys(targets))) if r]
 
-    async def discover(self) -> list[dict]:
-        found = await self.broadcast() or await self.scan()
+    async def discover(self, sweep: bool = True) -> list[dict]:
+        found = await self.broadcast()
+        if not found:
+            # sweeping every address is loud on a network that isn't yours: never from the background watcher,
+            # and not back to back. Asking Tailscale for its peers is targeted, so that always runs.
+            subnets = sweep and (not self.last_scan or time.monotonic() - self.last_scan > SCAN_EVERY)
+            if subnets:
+                self.last_scan = time.monotonic()
+            found = await self.scan(subnets)
         by_key: dict[str, dict] = {}
         for f in found:  # prefer a non-loopback address for each host key
             if f["key"] not in by_key or by_key[f["key"]]["addr"].startswith("127."):
@@ -959,24 +1188,26 @@ class Client:
                 if r.action == "accept" and r.data.ok:
                     return
                 raise BCError("Not connecting to that host.")
+        if invite:  # no popup available: an explicit join with the matching invite code is the user's yes
+            return
         raise BCError(f"{how.capitalize()} '{info['name']}' at {info['addr']} (host key {info['fp']}). Ask your user "
                       f"whether to connect; if they agree, call join_host(address='bc1:{info['addr']}:{info['fp']}').")
 
-    async def ensure_host(self, ctx: Context | None = None) -> dict:
+    async def ensure_host(self, ctx: Context | None = None, sweep: bool = True) -> dict:
         kh = self.known()
         if kh:
-            info = await self.hello(kh["addr"])
+            info = await self.hello(kh["addr"], timeout=2.5)
             if info and info["key"] == kh["key"]:
                 return {**kh, "boot": info["boot"]}
             if info:
                 raise BCError(f"The host at {kh['addr']} now has a different key ({info['fp']}, was {kh['fp']}). "
                               f"If you trust it, run /backchannel:join {kh['addr']}.")
-            for c in await self.discover():  # host moved (new IP)? the same key elsewhere is fine
+            for c in await self.discover(sweep):  # host moved (new IP)? the same key elsewhere is fine
                 if c["key"] == kh["key"]:
                     self.pin(c, kh["declined"])
                     return {**c, "declined": kh["declined"]}
             raise BCError(f"{kh['name']}'s backchannel is offline (last known at {kh['addr']}).")
-        found = await self.discover()
+        found = await self.discover(sweep)
         if not found:
             raise BCError("No backchannel host found on your networks. Ask the host for their invite code "
                           "(/backchannel:status on their side) and run /backchannel:join <code>.")
@@ -1024,14 +1255,14 @@ class Client:
         "clock_skew": "Your clock and {host}'s differ by more than two minutes; fix the time on one of the machines.",
     }
 
-    async def _post(self, host: dict, op: str, payload: dict) -> dict:
-        body = json.dumps(payload).encode()
+    async def _post(self, host: dict, op: str, payload: dict, timeout: float = 10) -> dict:
+        body = json.dumps({**payload, "sid": self.sid} if self.sid else payload).encode()
         path, ts, nonce = f"/api/{op}", str(int(time.time() * 1000)), secrets.token_urlsafe(16)
         sig = self.ident.sign(request_payload(host["key"], host["boot"], "POST", path, ts, nonce, body))
         headers = {"content-type": "application/json", "x-bc-key": self.ident.pub, "x-bc-ts": ts,
                    "x-bc-nonce": nonce, "x-bc-sig": sig}
         try:
-            status, rheaders, content = await self.fetch("POST", f"http://{host['addr']}{path}", 10, 512 * 1024,
+            status, rheaders, content = await self.fetch("POST", f"http://{host['addr']}{path}", timeout, 512 * 1024,
                                                          content=body, headers=headers)
         except (httpx.HTTPError, asyncio.TimeoutError) as e:
             raise BCError(f"Couldn't reach {host['name']}'s backchannel at {host['addr']} ({type(e).__name__}).") from e
@@ -1041,8 +1272,11 @@ class Client:
         if not rsig and status == 400:
             # rejected before authentication; only well-known codes are shown, never free text
             with contextlib.suppress(ValueError, AttributeError, RecursionError):
-                if json.loads(content).get("error") == "clock_skew":
+                code = json.loads(content).get("error")
+                if code == "clock_skew":
                     raise BCError(self._ERRORS["clock_skew"].format(host=host["name"]))
+                if code == "bad_signature":  # the host restarted (or another session took over) since our hello
+                    raise StaleHost(f"{host['name']}'s backchannel restarted mid-request; try again.")
         # nothing from the network is believed unless the pinned host key signed it for this exact request
         if not verify(host["key"], rsig, response_payload(host["key"], nonce, status, content)):
             raise BCError(f"Got an unsigned or forged reply from {host['addr']}; ignoring it. Someone may be "
@@ -1065,7 +1299,11 @@ class Client:
     async def call(self, ctx: Context | None, op: str, payload: dict | None = None) -> dict:
         host = await self.ensure_host(ctx)
         try:
-            return await self._post(host, op, payload or {})
+            try:
+                return await self._post(host, op, payload or {})
+            except StaleHost:
+                host = await self.ensure_host(ctx)
+                return await self._post(host, op, payload or {})
         except BCError as e:
             if "not_paired" not in str(e):
                 raise
@@ -1169,7 +1407,7 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
     async def send_message(to: str, message: str, ctx: Context) -> str:
         """Send a message or instruction to a friend. `to` is their name, or 'all' to message everyone."""
         if host:
-            return host.send(NAME, to, message)
+            return host.send(NAME, to, message, SESSION)
         return clean((await client.call(ctx, "send", {"to": to, "body": message})).get("result", "Sent."), 200)
 
     @mcp.tool()
@@ -1179,11 +1417,21 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
         also asks the user about anyone waiting to join."""
         if host:
             notes = await drain_pairing(ctx)
-            rows, more = host.store.unread(NAME)
+            rows, more = host.store.unread(NAME, sid=SESSION)
             return "\n\n".join(notes + [deliver(rows, more)])
-        r = await client.call(ctx, "check")
+        kh = client.known()
+        seen = client.seen(kh["key"]) if kh else 0
+        r = await client.call(ctx, "check", {"hold": True, "ack": seen})
         more = r.get("more") if isinstance(r.get("more"), int) else 0
-        return deliver(checked_rows(r.get("messages")), more)
+        raw = r.get("messages") if isinstance(r.get("messages"), list) else []
+        rows = checked_rows(raw)
+        ids = [m["id"] for m in raw if isinstance(m, dict) and isinstance(m.get("id"), int)]
+        kh = client.known()
+        if ids and kh:  # remember locally first, then tell the host; if that's lost the next check repeats it
+            client.mark_seen(kh["key"], max(ids))
+            with contextlib.suppress(BCError):
+                await client.call(ctx, "ack", {"id": client.seen(kh["key"])})
+        return deliver(rows, more)
 
     @mcp.tool()
     @guard
@@ -1218,11 +1466,16 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
         """Show this machine's backchannel role, identity, and connection state (and invite codes on the host)."""
         lines = [f"Role: {role}. You are '{NAME}', key {ident.fp}."]
         if host:
-            lines.append(f"Hosting on port {PORT}. Friends find you automatically; if they can't, give them an "
-                         f"invite code (it also proves it's really you):")
+            if host.serving:
+                lines.append(f"Hosting on port {PORT} from this session.")
+            else:
+                lines.append(f"Port {PORT} is held by another backchannel session on this machine, which is doing "
+                             f"the hosting; this session shares its messages and takes over if that one closes.")
+            lines.append("Friends find you automatically; if they can't, give them an invite code (it also proves "
+                         "it's really you):")
             lines += [f"  bc1:{i.ip}:{PORT}:{ident.fp}  ({ifn})" for ifn, i in bind_interfaces()]
             lines.append(f"{len(host.store.peers('accepted'))} paired, {host.store.pending_count()} waiting to join, "
-                         f"{host.store.unread_count(NAME)} unread for you.")
+                         f"{host.store.unread_count(NAME, SESSION)} unread for this session.")
             return "\n".join(lines)
         kh = client.known()
         if not kh:
@@ -1237,6 +1490,17 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
         except BCError as e:
             lines.append(str(e))
         return "\n".join(lines)
+
+    @mcp.tool()
+    @guard
+    async def watch_command() -> str:
+        """The shell command that waits for backchannel activity. It prints one line and exits when a message (or,
+        on the host, a join request) arrives, and costs nothing while it waits. Run it in the background."""
+        env = {"BACKCHANNEL_ROLE": role, "BACKCHANNEL_NAME": NAME, "BACKCHANNEL_PORT": str(PORT),
+               "BACKCHANNEL_SESSION": SESSION,
+               "BACKCHANNEL_BIND": BIND, "BACKCHANNEL_DATA": str(DATA)}
+        return shlex.join(["env", *(f"{k}={v}" for k, v in env.items()), "uv", "run", "--quiet", "--no-project",
+                           "--no-config", "--locked", "--script", os.path.abspath(__file__), "wait"])
 
     if client:
         @mcp.tool()
@@ -1259,10 +1523,14 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
             if p.name != name.strip().lower():
                 raise BCError(f"That key is asking to join as '{p.name}', not '{clean(name, 24)}'. Check list_peers.")
             if can_elicit(ctx):
-                r = await ctx.elicit(message=f"backchannel: {describe_request(host.store, p)}. Let them join?",
-                                     schema=JoinDecision)
-                if not (r.action == "accept" and r.data.accept):
-                    raise BCError(f"Not letting {p.name} in.")
+                try:
+                    r = await ctx.elicit(message=f"backchannel: {describe_request(host.store, p)}. Let them join?",
+                                         schema=JoinDecision)
+                except Exception as e:  # popup broken: this explicit tool call is the user's decision
+                    log(f"elicitation failed: {e}")
+                else:
+                    if not (r.action == "accept" and r.data.accept):
+                        raise BCError(f"Not letting {p.name} in.")
             if not host.store.accept(p.key, name.strip().lower(), ("pending", "revoked")):
                 raise BCError(f"That key is asking to join as '{p.name}', not '{clean(name, 24)}'. Check list_peers.")
             return f"{p.name} can now use the backchannel."
@@ -1297,9 +1565,6 @@ async def run_stdio() -> None:
         async def relay():
             try:
                 await host.serve(install_signal_handlers=False)
-            except OSError as e:
-                log(f"not hosting on port {PORT} ({e.strerror}); another backchannel host may already be running "
-                    f"on this machine")
             except Exception as e:  # keep the local MCP session alive even if hosting fails
                 log(f"relay stopped: {e!r}")
 
@@ -1310,8 +1575,85 @@ async def run_stdio() -> None:
     else:
         if ROLE != "client":
             log(f"unknown role '{ROLE}', acting as client")
-        client = Client(ident, NAME, DATA, PORT)
+        client = Client(ident, NAME, DATA, PORT, SESSION)
         await build_mcp("client", ident, None, client).run_stdio_async()
+
+
+def _say(line: str) -> None:
+    print(f"backchannel: {line}", flush=True)
+
+
+async def wait_host() -> int:
+    """Host side of `wait`: watch the local store for unread messages and new join requests."""
+    store = Store(DATA / "backchannel.db")
+    told_file = DATA / "announced.json"  # each join request wakes a watcher once, however long it stays pending
+
+    def fresh_requests() -> list[str]:
+        told: list = []
+        with contextlib.suppress(OSError, ValueError):
+            told = json.loads(told_file.read_text())
+        told = told if isinstance(told, list) else []
+        now = [f"{p.key}:{p.updated}" for p in store.peers("pending") if time.time() - p.updated < PENDING_TTL]
+        new = [t for t in now if t not in told]
+        if new:
+            with contextlib.suppress(OSError):
+                write_private(told_file, json.dumps(now))
+        return new
+
+    parent, first, touched = os.getppid(), True, -1e9
+    while os.getppid() == parent:
+        if not first:
+            await asyncio.sleep(2)
+        first = False
+        if time.monotonic() >= touched + 20:
+            touched = time.monotonic()
+            store.touch(NAME, SESSION, waiting=True)
+        w = store.waiting(NAME, sid=SESSION)
+        fresh = fresh_requests()
+        if w["unread"] or fresh:
+            bits = []
+            if w["unread"]:
+                bits.append(f"{w['unread']} new message(s) from {', '.join(w['from'])}")
+            if fresh:
+                bits.append(f"{len(fresh)} request(s) to join")
+            _say(f"{' and '.join(bits)}. Run /backchannel:check.")
+            return 0
+    return 0
+
+
+async def wait_client() -> int:
+    """Client side of `wait`: long-poll the pinned host. Never looks for a host by sweeping addresses."""
+    client = Client(Identity(DATA / "identity.json"), NAME, DATA, PORT, SESSION)
+    if not client.known():
+        _say("not connected to a host yet, so there is nothing to watch. Run /backchannel:check first.")
+        return 2
+    parent, delay, host = os.getppid(), 5, None
+    while os.getppid() == parent:
+        try:
+            host = host or await client.ensure_host(sweep=False)
+            r = await client._post(host, "wait", {"after": client.seen(host["key"]), "timeout": WAIT_HOLD},
+                                   timeout=WAIT_HOLD + 15)
+        except StaleHost:
+            host = None
+            continue
+        except BCError as e:
+            msg, host = str(e), None
+            if "unknown_op" in msg:
+                _say("this host runs an older backchannel without push. Fall back to checking on an interval.")
+                return 3
+            if "declined or removed" in msg or "different key" in msg:
+                _say(msg)
+                return 2
+            # offline, not accepted yet, rate limited, too many watchers: quietly try again later
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120)
+            continue
+        delay = 5
+        if isinstance(r.get("unread"), int) and r["unread"] > 0:
+            who = [n for n in r.get("from") or [] if valid_name(n)] if isinstance(r.get("from"), list) else []
+            _say(f"{r['unread']} new message(s){' from ' + ', '.join(who) if who else ''}. Run /backchannel:check.")
+            return 0
+    return 0
 
 
 def cli(argv: list[str]) -> None:
@@ -1320,6 +1662,8 @@ def cli(argv: list[str]) -> None:
     cmd = argv[0]
     if cmd == "serve":
         asyncio.run(make_host(ident).serve(install_signal_handlers=True))
+    elif cmd == "wait":
+        sys.exit(asyncio.run(wait_host() if ROLE == "host" else wait_client()))
     elif cmd == "status":
         print(f"name {NAME}, key {ident.fp}, data {DATA}")
         for ifn, i in bind_interfaces():
@@ -1340,7 +1684,9 @@ def cli(argv: list[str]) -> None:
             if not store.accept(p.key, argv[3].strip().lower(), ("pending", "revoked")):
                 sys.exit(f"{p.fp} is asking to join as '{p.name}', not '{argv[3]}'; run 'peers' again and check.")
             print(f"accepted {p.name} ({p.fp})")
-        elif action == "revoke" and matches:
+        elif action == "revoke" and ref:
+            if not matches:
+                sys.exit(f"nobody matches '{ref}'; run 'peers' to list everyone.")
             for p in matches:
                 store.revoke(p.key)
                 print(f"revoked {p.name} ({p.fp})")

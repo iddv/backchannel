@@ -63,8 +63,8 @@ class Agent:
     """One backchannel stdio server plus an MCP client session talking to it. `answers` are queued replies to
     elicitation popups ("accept", "decline", "cancel", or an async callable returning one of those)."""
 
-    def __init__(self, stack, role: str, name: str, data: Path):
-        self.stack, self.role, self.name, self.data = stack, role, name, data
+    def __init__(self, stack, role: str, name: str, data: Path, port: int = PORT, popups: bool = True):
+        self.stack, self.role, self.name, self.data, self.port, self.popups = stack, role, name, data, port, popups
         self.answers: list = []
         self.prompts: list[str] = []
 
@@ -80,11 +80,12 @@ class Agent:
 
     async def start(self):
         env = {**os.environ, "BACKCHANNEL_ROLE": self.role, "BACKCHANNEL_NAME": self.name,
-               "BACKCHANNEL_PORT": str(PORT), "BACKCHANNEL_DATA": str(self.data), "CLAUDE_PLUGIN_DATA": str(self.data)}
+               "BACKCHANNEL_PORT": str(self.port), "BACKCHANNEL_DATA": str(self.data), "CLAUDE_PLUGIN_DATA": str(self.data)}
         params = StdioServerParameters(command="uv", args=["run", "--quiet", "--no-project", "--no-config", "--locked",
                                                            "--script", str(ROOT / "backchannel.py")], env=env)
         r, w = await self.stack.enter_async_context(stdio_client(params))
-        self.s = await self.stack.enter_async_context(ClientSession(r, w, elicitation_callback=self._elicit))
+        self.s = await self.stack.enter_async_context(ClientSession(
+            r, w, elicitation_callback=self._elicit if self.popups else None))
         await self.s.initialize()
         return self
 
@@ -301,6 +302,7 @@ async def main():
         bob.answers.append("accept")
         out = await bob.call("join_host", address=f"bc1:127.0.0.1:{PROXY_PORT}:{host_fp}")
         check("forged reply" in out, "client rejects responses altered in transit", out)
+        last_pair = time.time()
         server.should_exit = True
         await task
 
@@ -327,10 +329,162 @@ async def main():
         big.should_exit = True
         await big_task
 
+        # --- watching without polling
+        cmd = await sam.call("watch_command")
+        check(cmd.startswith("env ") and cmd.endswith(" wait"), "watch_command returns the wait command", cmd)
+
+        async def watcher(command: str):
+            return await asyncio.create_subprocess_shell(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        async def finished(proc, within: float) -> str | None:
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), within)
+                return out.decode()
+            except asyncio.TimeoutError:
+                return None
+
+        await sam.call("check_messages")
+        w = await watcher(cmd)
+        check(await finished(w, 4) is None, "the watcher stays silent while nothing is new")
+        w.kill()
+        w = await watcher(cmd)
+        await asyncio.sleep(2.5)
+        await host.call("send_message", to="sam", message="ping while you wait")
+        out = await finished(w, 6)
+        check(out is not None and "1 new message(s) from iddv" in out and "ping" not in out,
+              "the watcher wakes within seconds of a message, without showing its body", out)
+        out = await sam.call("check_messages")
+        check("ping while you wait" in out, "the message is still unread after the watcher fired", out)
+        w = await watcher(cmd)
+        check(await finished(w, 4) is None, "after reading, the watcher goes quiet again")
+        w.kill()
+
+        hw = await watcher(await host.call("watch_command"))
+        await asyncio.sleep(2.5)
+        await sam.call("send_message", to="iddv", message="hello host")
+        out = await finished(hw, 6)
+        check(out is not None and "new message(s) from sam" in out, "the host's watcher wakes on a message too", out)
+        await host.call("check_messages")
+
+        # --- wire compatibility: a v0.3 client (plain check) and the newer hold/ack/wait calls
+        await asyncio.sleep(max(0, 61 - (time.time() - last_pair)))  # the per-IP pairing limit above is used up
+        old = Raw(tmp / "oldie")
+        r, _ = await old.post("pair", {"name": "oldie"})
+        check(r.status_code == 202, "pairing works again once the rate-limit window passes", r.text)
+        host.answers.append("accept")
+        await host.call("check_messages")
+        await host.call("send_message", to="oldie", message="one")
+        r, _ = await old.post("check", {})
+        r2, _ = await old.post("check", {})
+        check(len(r.json()["messages"]) == 1 and r2.json()["messages"] == [], "a v0.3-style check still marks read",
+              (r.text, r2.text))
+        await host.call("send_message", to="oldie", message="two")
+        r, _ = await old.post("wait", {"after": 0, "timeout": 0})
+        check(r.json().get("unread") == 1 and r.json().get("from") == ["iddv"], "wait reports unread without reading",
+              r.text)
+        r, _ = await old.post("check", {"hold": True})
+        r2, _ = await old.post("check", {"hold": True})
+        mid = r.json()["messages"][0]["id"]
+        check(r2.json()["messages"][0]["id"] == mid, "held messages are redelivered until acknowledged", r2.text)
+        await old.post("ack", {"id": 10 ** 9})
+        r, _ = await old.post("check", {"hold": True})
+        check(r.json()["messages"] == [], "ack marks them read (and can't run past the newest message)", r.text)
+        await host.call("send_message", to="oldie", message="three")
+        r, _ = await old.post("check", {})
+        check(len(r.json()["messages"]) == 1, "a huge ack doesn't swallow later messages", r.text)
+        t0 = time.time()
+        r, _ = await old.post("wait", {"after": 0, "timeout": 2})
+        check(r.json().get("unread") == 0 and 1.5 < time.time() - t0 < 5, "wait holds, then reports nothing new", r.text)
+
+        # --- a second session on the host machine shares the store and says who is hosting
+        host2 = await Agent(stack, "host", "iddv", tmp / "host").start()
+        await asyncio.sleep(1)
+        out = await host2.call("status")
+        check("held by another backchannel session" in out, "second host session says it isn't the one hosting", out)
+        out = await host.call("status")
+        check("from this session" in out, "first host session says it is", out)
+        # sam's session has been talking to the first host session, so the conversation stays there
+        await sam.call("send_message", to="iddv", message="for the session I was talking to")
+        out = await host2.call("check_messages")
+        check("No new messages" in out, "another session of the recipient doesn't get a locked conversation", out)
+        out = await host.call("check_messages")
+        check("for the session I was talking to" in out, "the session in the conversation does", out)
+        await host2.call("send_message", to="sam", message="hello from my other session")
+        out = await sam.call("check_messages")
+        check("hello from my other session" in out, "a different session can still start its own conversation", out)
+
+        # --- a client whose app has no popups can still join, with the invite code as the confirmation
+        plain = await Agent(stack, "client", "plain", tmp / "plain", popups=False).start()
+        out = await plain.call("check_messages")
+        code = out.split("join_host(address='")[1].split("'")[0] if "join_host(address='" in out else ""
+        check(code.startswith("bc1:"), "without popups the client asks the agent to ask the user", out)
+        out = await plain.call("join_host", address=code)
+        check("Pairing request sent" in out, "and an explicit invite-code join then goes through", out)
+
         out = await host.call("revoke_peer", name_or_fingerprint="sam")
         check("Removed" in out, "host revokes sam", out)
         out = await sam.call("send_message", to="iddv", message="x")
         check("declined or removed you" in out, "revoked client can't send", out)
+
+    # --- when the process that hosts goes away, another session on the same machine takes over
+    env = {**os.environ, "BACKCHANNEL_NAME": "duo", "BACKCHANNEL_PORT": str(PORT + 10),
+           "BACKCHANNEL_DATA": str(tmp / "duo")}
+    first = subprocess.Popen(["uv", "run", "--quiet", "--no-project", "--no-config", "--locked", "--script",
+                              str(ROOT / "backchannel.py"), "serve"], env=env, stderr=subprocess.DEVNULL)
+    async with contextlib.AsyncExitStack() as s2:
+        await asyncio.sleep(2)
+        second = await Agent(s2, "host", "duo", tmp / "duo", port=PORT + 10).start()
+        await asyncio.sleep(1)
+        check("held by another" in await second.call("status"), "standby session waits for the port")
+        first.terminate()
+        first.wait(10)
+        out = ""
+        for _ in range(20):
+            await asyncio.sleep(1)
+            out = await second.call("status")
+            if "from this session" in out:
+                break
+        check("from this session" in out, "standby session takes over hosting", out)
+        r = httpx.get(f"http://127.0.0.1:{PORT + 10}/hello", params={"nonce": "xxxxxxxx"}, trust_env=False)
+        check(r.json().get("name") == "duo", "and answers on the port", r.text)
+
+    # --- conversations lock to the two sessions in them
+    X, Y, S1, S2 = "a" * 12, "b" * 12, "c" * 12, "d" * 12
+    ls = bc.Store(tmp / "lock.db")
+    h = bc.Host(bc.Identity(tmp / "lock.json"), ls, "ann", PORT + 20)
+    ls.db.execute("INSERT INTO peers(key,name,fp,status,addr,updated,joined_id) VALUES('k','ben','f','accepted','',0,0)")
+    got = lambda user, sid="", hold=False: [m["body"] for m in ls.unread(user, hold, sid)[0]]
+    for s_ in (S1, S2, Y):
+        ls.touch("ben" if s_ != Y else "ann", s_)
+    h.send("ann", "ben", "q1", X)
+    h.send("ann", "ben", "q2", X)
+    check(ls.waiting("ben", sid=S1)["unread"] == 2 and ls.waiting("ben", sid=S2)["unread"] == 2,
+          "an unclaimed message is offered to every session of the recipient")
+    check(got("ben", S1) == ["q1", "q2"] and got("ben", S2) == [], "the first session to read it claims it")
+    h.send("ben", "ann", "a1", S1)
+    check(got("ann", Y) == [] and got("ann", X) == ["a1"], "the reply goes only to the session that asked")
+    h.send("ann", "ben", "q3", X)
+    check(got("ben", S2) == [] and ls.waiting("ben", sid=S2)["unread"] == 0 and got("ben", S1) == ["q3"],
+          "later messages stay between the two locked sessions")
+    h.send("ann", "ben", "y1", Y)
+    check(got("ben", S2) == ["y1"], "a different session starts its own conversation, read out of order")
+    h.send("ben", "ann", "a2", S1)
+    h.send("ben", "all", "news", S1)
+    check(got("ann", Y) == ["news"] and got("ann", X) == ["a2"], "broadcasts reach whichever session checks first")
+    h.send("ann", "ben", "q4", X)
+    check(got("ben") == ["q4"], "a client without sessions (v0.3) sees everything for its name")
+    h.send("ann", "ben", "q5", X)
+    check(got("ben", S1, hold=True) == ["q5"] and got("ben", S1, hold=True) == ["q5"], "held messages stay unread")
+    ls.ack("ben", 10 ** 9, S1)
+    check(got("ben", S1) == [] and ls.db.execute("SELECT COUNT(*) FROM readmarks").fetchone()[0] == 0
+          and ls._cursor("ben") == ls.db.execute("SELECT MAX(id) FROM messages").fetchone()[0],
+          "once everything is read the bookkeeping collapses back to one cursor")
+    h.send("ann", "ben", "q6", X)
+    ls.db.execute("UPDATE sessions SET last_seen=? WHERE sid=?", (time.time() - bc.SESSION_TTL - 5, S1))
+    check(got("ben", S2) == ["q6"], "a session that has gone away no longer holds its conversations")
+    h.send("ann", "ben", "q7", X)
+    ls.touch("ben", S1)
+    check(got("ben", S1) == [] and got("ben", S2) == ["q7"], "and the conversation moves to the session that took over")
 
     # --- store-level checks
     st = bc.Store(tmp / "unit.db")

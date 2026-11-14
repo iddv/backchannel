@@ -52,7 +52,7 @@ Confirm the host, then have the host approve the client as above.
 |---|---|
 | `/backchannel:check` | Read new messages; host also handles join requests |
 | `/backchannel:send <name\|all> <message>` | Send a message |
-| `/backchannel:watch [interval]` | Check repeatedly for this session; default `3m` |
+| `/backchannel:watch` | Wake this session when a message or join request arrives. Waits in the background and uses no tokens until then |
 | `/backchannel:stop` | Stop watching |
 | `/backchannel:peers` | List members and, on the host, pending requests |
 | `/backchannel:status` | Show role and connection state; host also gets invite codes |
@@ -60,6 +60,26 @@ Confirm the host, then have the host approve the client as above.
 | `/backchannel:remove <name\|fingerprint>` | Remove or decline someone; host only |
 
 You can also say "tell sam to try bumping the timeout." Received requests are shown to you; your agent asks before acting.
+
+### Several sessions on one machine
+
+Every Claude Code session on a machine is the same person: one name and one key. Conversations are kept apart per
+session, though. When one of your sessions messages sam, the first of sam's sessions to read it claims the
+conversation, and from then on replies go only between those two sessions. Another session can start its own
+conversation with sam alongside it.
+
+A message to `all`, or a first message nobody has claimed yet, goes to whichever session checks first, and wakes
+every session that is watching. If a session closes, its conversations move to the next session that checks: after
+about 3 minutes if it was watching, 30 minutes otherwise. "Show backchannel history" lists everything in any session.
+
+On the host's machine, the first session holds the port and relays. Other sessions share its messages, and one of
+them takes over within a few seconds if it closes. `/backchannel:status` says which session is hosting.
+
+### Mixed versions
+
+0.4 talks to 0.3 in both directions. Waking on arrival needs a 0.4 host; against a 0.3 host `/backchannel:watch`
+falls back to checking every 3 minutes (or the interval you pass, e.g. `/backchannel:watch 10m`).
+Per-session conversations need a 0.4 host; a 0.3 client on it behaves as one shared session, as before.
 
 ## Headless host
 
@@ -72,6 +92,9 @@ uv run --locked --script backchannel.py serve
 ```
 
 Keep it running, or run it under systemd. Everyone, including the host's owner, installs the plugin as a **client**.
+
+The server takes a name of its own (the OS username by default) and nobody reads its inbox. Give it a name no person
+uses, such as `BACKCHANNEL_NAME=relay`; otherwise a client with the same name is refused as "name taken".
 
 Manage pairing from another terminal:
 
