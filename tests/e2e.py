@@ -303,6 +303,8 @@ async def main():
         out = await bob.call("join_host", address=f"bc1:127.0.0.1:{PROXY_PORT}:{host_fp}")
         check("forged reply" in out, "client rejects responses altered in transit", out)
         last_pair = time.time()
+        # on a slow machine the pairing rate limit has lapsed and bob's request got through the proxy: clear it
+        await host.call("revoke_peer", name_or_fingerprint="bob")
         server.should_exit = True
         await task
 
