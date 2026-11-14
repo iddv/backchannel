@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import shlex
+import sys
 from typing import Protocol
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -307,21 +308,8 @@ def build_mcp(cfg: Config, ident: Identity, backend: Backend) -> FastMCP:
             "BACKCHANNEL_BIND": cfg.bind,
             "BACKCHANNEL_DATA": str(cfg.data),
         }
-        return shlex.join(
-            [
-                "env",
-                *(f"{k}={v}" for k, v in env.items()),
-                "uv",
-                "run",
-                "--quiet",
-                "--no-project",
-                "--no-config",
-                "--locked",
-                "--script",
-                cfg.script,
-                "wait",
-            ]
-        )
+        # the interpreter this server runs in already has everything installed, so the watcher starts at once
+        return shlex.join(["env", *(f"{k}={v}" for k, v in env.items()), sys.executable, "-m", "backchannel", "wait"])
 
     backend.register(mcp)
     return mcp

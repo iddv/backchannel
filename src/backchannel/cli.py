@@ -35,13 +35,16 @@ from .tools import ClientBackend, HostBackend, build_mcp
 USAGE = """\
 backchannel: pass messages and instructions between friends' AI agents on a private network.
 
-    backchannel.py           stdio MCP server (role from BACKCHANNEL_ROLE)
-    backchannel.py serve     headless host (e.g. a homelab box)
-    backchannel.py peers [accept <fingerprint> <name> | revoke <name|fingerprint>]
-    backchannel.py status
-    backchannel.py wait      block until something new arrives, print one line, exit
+Everyone runs this same program as a local stdio MCP server. One person picks the `host` role: their copy also
+runs a small signed JSON relay (HTTP) and answers UDP discovery broadcasts. `client` copies find the host
+automatically, ask the user to confirm it, ask the host to pair, and sign every request with a per-device Ed25519
+key. Every relay response is signed by the host key the client pinned. MCP itself never goes over the network.
 
-Run it with: uv run --locked --script backchannel.py ...
+    backchannel           stdio MCP server (role from BACKCHANNEL_ROLE)
+    backchannel serve     headless host (e.g. a homelab box)
+    backchannel peers [accept <fingerprint> <name> | revoke <name|fingerprint>]
+    backchannel status
+    backchannel wait      block until something new arrives, print one line, exit
 """
 
 
@@ -225,7 +228,7 @@ def peers_command(cfg: Config, args: list[str]) -> None:
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     setup_logging()
-    cfg = Config.from_env(script=os.path.abspath(sys.argv[0]))
+    cfg = Config.from_env()
     prepare_data_dir(cfg.data)
     ident = Identity(cfg.data / "identity.json")
     command = argv[0] if argv else ""

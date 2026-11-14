@@ -6,8 +6,8 @@ import time
 import pytest
 from harness import Identity, Store, respell
 
-from bchan.config import SESSION_TTL
-from bchan.host import Host
+from backchannel.config import SESSION_TTL
+from backchannel.host import Host
 
 X, Y, S1, S2 = "a" * 12, "b" * 12, "c" * 12, "d" * 12  # two of ann's sessions, two of ben's
 

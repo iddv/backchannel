@@ -109,7 +109,7 @@ For an always-on homelab host, clone this repo and run from its directory:
 ```bash
 git clone https://github.com/iddv/backchannel.git
 cd backchannel
-uv run --locked --script backchannel.py serve
+uv run --locked --no-dev backchannel serve
 ```
 
 Keep it running, or run it under systemd. Everyone, including the host's owner, installs the plugin as a **client**.
@@ -120,9 +120,9 @@ uses, such as `BACKCHANNEL_NAME=relay`; otherwise a client with the same name is
 Manage pairing from another terminal:
 
 ```bash
-uv run --locked --script backchannel.py status
-uv run --locked --script backchannel.py peers
-uv run --locked --script backchannel.py peers accept <fingerprint> <name>
+uv run --locked --no-dev backchannel status
+uv run --locked --no-dev backchannel peers
+uv run --locked --no-dev backchannel peers accept <fingerprint> <name>
 ```
 
 `status` prints invite codes. `peers` lists pending requests for approval.
@@ -138,19 +138,15 @@ Set these environment variables consistently for the server and management comma
 
 Don't expose the port to the internet. See [SECURITY.md](SECURITY.md) for what is and isn't protected.
 
-## Code
+## Development
 
-`backchannel.py` is the entry point and the dependency list. The code is the `bchan` package beside it: `config`
-(limits, settings, errors), `crypto` (keys and what gets signed), `store` (SQLite), `host` (the relay), `client`,
-`tools` (what the agent sees) and `cli`.
-
-## Tests
-
-From the repo directory:
+A standard Python project: `pyproject.toml`, the package in `src/backchannel/`, tests in `tests/`, dependencies pinned
+in `uv.lock`. The modules are `config` (limits, settings, errors), `crypto` (keys and what gets signed), `store`
+(SQLite), `host` (the relay), `client`, `tools` (what the agent sees) and `cli`.
 
 ```bash
-uv run --no-project --no-config --locked --script tests/run.py
+uv run pytest                                      # about a minute
+uv run ruff check . && uv run ruff format --check .
 ```
 
-Test hosts listen on loopback only; set `BACKCHANNEL_BIND=private` to also cover LAN binding, as CI does. Lint with
-`uvx ruff check . && uvx ruff format --check .`.
+Test hosts listen on loopback only; set `BACKCHANNEL_BIND=private` to also cover LAN binding, as CI does.

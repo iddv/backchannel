@@ -75,10 +75,9 @@ class Config:
     bind: str  # overlay | private | comma-separated IPs
     data: Path
     session: str  # one id per Claude Code session (each runs its own copy of the server); the watcher inherits it
-    script: str  # the entry script, so the server can tell the agent how to start a watcher
 
     @classmethod
-    def from_env(cls, script: str = "") -> Config:
+    def from_env(cls) -> Config:
         sid = _env("BACKCHANNEL_SESSION")
         try:
             port = int(_env("BACKCHANNEL_PORT", "8787"))
@@ -92,7 +91,6 @@ class Config:
             bind=_env("BACKCHANNEL_BIND", "overlay"),
             data=Path(_env("BACKCHANNEL_DATA", _env("CLAUDE_PLUGIN_DATA", home))),
             session=sid if SID_RE.fullmatch(sid) else secrets.token_hex(6),
-            script=script,
         )
 
 

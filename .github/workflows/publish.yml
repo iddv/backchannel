@@ -1,0 +1,21 @@
+name: publish
+# Publishes to PyPI when a GitHub release is published. No token is stored: PyPI trusts this workflow directly
+# ("trusted publishing"), configured once on pypi.org for this repository, this file name and the `pypi` environment.
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: The release tag matches the project version
+        run: test "v$(uv version --short)" = "${{ github.event.release.tag_name }}"
+      - run: uv build
+      - run: uv publish

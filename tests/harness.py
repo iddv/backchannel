@@ -18,14 +18,14 @@ import httpx
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+from backchannel.crypto import Identity, fingerprint, request_payload
+from backchannel.store import Store
 
-from bchan.crypto import Identity, fingerprint, request_payload  # noqa: E402
-from bchan.store import Store  # noqa: E402
+ROOT = Path(__file__).resolve().parent.parent
 
 BIND = os.environ.get("BACKCHANNEL_BIND", "127.0.0.1")
-LAUNCH = ["uv", "run", "--quiet", "--no-project", "--no-config", "--locked", "--script", str(ROOT / "backchannel.py")]
+# the installed package in this environment; test_packaging.py covers the command line the plugin really uses
+LAUNCH = [sys.executable, "-m", "backchannel"]
 _ports = itertools.count(int(os.environ.get("BC_TEST_PORT", "18787")), 7)
 
 

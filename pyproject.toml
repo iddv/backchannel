@@ -1,0 +1,72 @@
+[project]
+name = "backchannel"
+version = "0.6.0"
+description = "Pass a note to your friend's coding agent: a private-network message relay for Claude Code, as an MCP server."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "iddv" }]
+keywords = ["mcp", "claude-code", "agents", "messaging", "zerotier", "tailscale"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Chat",
+]
+dependencies = [
+    "mcp>=1.10,<2",
+    "cryptography>=42",
+    "psutil>=5.9",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+    "starlette>=0.40",
+    "pydantic>=2.7",
+]
+
+[project.urls]
+Repository = "https://github.com/iddv/backchannel"
+Issues = "https://github.com/iddv/backchannel/issues"
+Security = "https://github.com/iddv/backchannel/blob/main/SECURITY.md"
+
+[project.scripts]
+backchannel = "backchannel.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.17"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backchannel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-q -p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RET", "ASYNC", "S", "PLE", "RUF"]
+ignore = [
+    "S101",          # assert is fine in tests
+    "S104",          # the UDP responder binds 0.0.0.0 on purpose and filters by source address
+    "S603", "S607",  # subprocess with a fixed argument list
+    "SIM105",        # try/except/pass is sometimes clearer than suppress
+    "RET505",
+    "UP041",         # asyncio.TimeoutError reads clearer next to asyncio.wait_for
+    "ASYNC109",      # functions that take a timeout and pass it on
+    "RUF012",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# the store assembles queries from its own constant fragments; every value is a bound parameter
+"src/backchannel/store.py" = ["S608"]
+"tests/*" = ["S", "B011", "ASYNC"]

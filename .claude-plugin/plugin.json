@@ -1,6 +1,6 @@
 {
   "name": "backchannel",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Pass messages and instructions between friends' agents on a private network. One friend hosts; everyone else finds them automatically.",
   "author": {
     "name": "iddv",
@@ -37,11 +37,12 @@
       "args": [
         "run",
         "--quiet",
-        "--no-project",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
         "--no-config",
         "--locked",
-        "--script",
-        "${CLAUDE_PLUGIN_ROOT}/backchannel.py"
+        "--no-dev",
+        "backchannel"
       ],
       "env": {
         "BACKCHANNEL_ROLE": "${user_config.role}",

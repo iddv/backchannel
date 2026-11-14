@@ -36,7 +36,7 @@ LAN. It assumes:
 | Joining arbitrary servers | `join` only accepts private-network IP literals |
 | Scanning networks that aren't yours | The background watcher never sweeps addresses; other actions sweep a subnet at most once every 10 minutes |
 | Exposure on untrusted networks | The host listens only on ZeroTier/Tailscale interfaces when they exist, plus loopback. It accepts only sources from those networks and only IP-literal `Host` headers, which blocks DNS rebinding. It re-checks its interfaces every 15 s, so it moves to the overlay when that comes up |
-| Supply chain | Dependencies are locked (`backchannel.py.lock`) and run with `uv run --locked --no-project --no-config`, so a `uv.toml` or `pyproject.toml` in your working project can't redirect package installs |
+| Supply chain | Dependencies are pinned with hashes in `uv.lock`, and the plugin starts with `uv run --project <plugin> --locked --no-config`, so a `uv.toml` or `pyproject.toml` in the project you are working on can't redirect package installs |
 | Local data | The data directory is mode 0700 and the key, database and state files are 0600 |
 
 ## What isn't
