@@ -69,8 +69,12 @@ conversation, and from then on replies go only between those two sessions. Anoth
 conversation with sam alongside it.
 
 A message to `all`, or a first message nobody has claimed yet, goes to whichever session checks first, and wakes
-every session that is watching. If a session closes, its conversations move to the next session that checks: after
-about 3 minutes if it was watching, 30 minutes otherwise. "Show backchannel history" lists everything in any session.
+every session that is watching.
+
+No session ever takes over another's conversation. If a session closes, messages addressed to it stay with it: your
+other sessions are told once that they exist, and "show backchannel history" lists them. The next message its
+partner sends starts a new conversation with whichever of your sessions reads it. A session that is restarted or
+resumed counts as a new one.
 
 On the host's machine, the first session holds the port and relays. Other sessions share its messages, and one of
 them takes over within a few seconds if it closes. `/backchannel:status` says which session is hosting.

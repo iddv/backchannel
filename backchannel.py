@@ -90,8 +90,8 @@ WAIT_PER_PEER = 4                  # concurrent long-polls per key (one per watc
 WAIT_TOTAL = 32
 SCAN_EVERY = 600                   # at most one address sweep per process in this many seconds
 REBIND_EVERY = 15                  # how often the host looks for changed interfaces / a freed port
-SESSION_TTL = 1800                 # a session not heard from for this long no longer holds its conversations
-WATCHER_TTL = 180                  # ... or this long, if it was watching (watchers call in every WAIT_HOLD s)
+HEARTBEAT = 60                     # every session tells the host it is still open this often
+SESSION_TTL = 180                  # a session silent for this long is treated as closed
 SID_RE = re.compile(r"[0-9a-f]{12}")
 OVERLAY_PREFIXES = ("zt", "feth", "tailscale")
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
@@ -393,6 +393,8 @@ class Store:
             for col in ("sender_sid", "recipient_sid"):  # v0.3 databases; '' means "no particular session"
                 if col not in mcols:
                     self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+            if "noted" not in mcols:  # 1 once the user was told this message is stuck with a closed session
+                self.db.execute("ALTER TABLE messages ADD COLUMN noted INTEGER NOT NULL DEFAULT 0")
             self.db.execute("CREATE TABLE IF NOT EXISTS sessions (user TEXT NOT NULL, sid TEXT NOT NULL, "
                             "last_seen REAL NOT NULL, last_wait REAL NOT NULL DEFAULT 0, PRIMARY KEY(user, sid))")
             # links: `user`'s session `sid` is in conversation with `peer`'s session `peer_sid`
@@ -498,7 +500,9 @@ class Store:
         self.db.execute("INSERT INTO sends(sender,ts) VALUES(?,?)", (sender, time.time()))
 
     # sessions: a person can have several agent sessions open. A conversation locks to the two sessions in it:
-    # the one that sent the first message and the one that first read it. Replies then go only to those two.
+    # the one that sent the first message and the one that first read it. Replies then go only to those two, and
+    # no other session ever takes a conversation over. If a session closes, what was addressed to it stays with
+    # it (readable in history); the next message its partner sends starts a new conversation.
     def touch(self, user: str, sid: str, waiting: bool = False) -> None:
         if sid:
             now = time.time()
@@ -507,12 +511,9 @@ class Store:
                             (user, sid, now, now if waiting else 0))
 
     def live_sessions(self, user: str) -> list[str]:
-        """Sessions still around to receive what's addressed to them. A watcher that goes quiet is gone quickly;
-        a session that only checks by hand gets the benefit of the doubt for longer."""
-        now = time.time()
-        return [r[0] for r in self.db.execute(
-            "SELECT sid FROM sessions WHERE user=? AND last_seen > CASE WHEN last_seen-last_wait < ? THEN ? ELSE ? END",
-            (user, WATCHER_TTL, now - WATCHER_TTL, now - SESSION_TTL))]
+        """Sessions that are still open: each one calls in every HEARTBEAT seconds."""
+        return [r[0] for r in self.db.execute("SELECT sid FROM sessions WHERE user=? AND last_seen>?",
+                                              (user, time.time() - SESSION_TTL))]
 
     def linked(self, user: str, sid: str, peer: str) -> str:
         r = self.db.execute("SELECT peer_sid FROM links WHERE user=? AND sid=? AND peer=?", (user, sid, peer)).fetchone()
@@ -528,16 +529,29 @@ class Store:
         return max(r[0] if r else 0, self.joined_id(user))
 
     def _unread(self, user: str, sid: str = "", after: int = 0) -> tuple[str, list]:
-        """WHERE clause for what `user` hasn't read. With a session id, leave out messages that belong to another
-        of their sessions, unless that session has gone away. Without one (v0.3 clients), everything for the name."""
+        """WHERE clause for what `user` hasn't read. With a session id, only broadcasts, unclaimed messages and
+        this session's own conversations. Without one (v0.3 clients), everything for the name."""
         where = ("WHERE id>? AND (recipient=? OR recipient='all') AND sender!=? "
                  "AND id NOT IN (SELECT msg_id FROM readmarks WHERE user=?)")
         args: list = [max(self._cursor(user), after), user, user, user]
         if sid:
-            live = [x for x in self.live_sessions(user) if x != sid]
-            where += f" AND (recipient='all' OR recipient_sid IN ('',?) OR recipient_sid NOT IN ({','.join('?' * len(live))}))"
-            args += [sid, *live]
+            where += " AND (recipient='all' OR recipient_sid IN ('',?))"
+            args.append(sid)
         return where, args
+
+    def stranded(self, user: str, sid: str, note: bool = False) -> dict:
+        """Unread messages addressed to a session of `user` that has closed. They are never handed to another
+        session; a session that checks is told once (`note`) so the user can read them in history."""
+        if not sid:
+            return {"count": 0, "from": []}
+        live = self.live_sessions(user)
+        where, args = self._unread(user)
+        rows = self.db.execute(
+            f"SELECT id,sender FROM messages {where} AND recipient=? AND noted=0 AND recipient_sid NOT IN "
+            f"('',?,{','.join('?' * len(live)) or "''"}) ORDER BY id LIMIT 200", (*args, user, sid, *live)).fetchall()
+        if note and rows:
+            self.db.executemany("UPDATE messages SET noted=1 WHERE id=?", [(r[0],) for r in rows])
+        return {"count": len(rows), "from": sorted({r[1] for r in rows if valid_name(r[1])})[:10]}
 
     def _mark(self, user: str, ids: list[int]) -> None:
         """Mark messages read, then move the cursor up to just below the oldest one still unread by anyone."""
@@ -565,8 +579,9 @@ class Store:
         after = after if isinstance(after, int) and not isinstance(after, bool) else 0
         where, args = self._unread(user, sid, after)
         rows = self.db.execute(f"SELECT id,sender FROM messages {where} ORDER BY id LIMIT 200", args).fetchall()
-        return {"unread": len(rows), "latest": rows[-1][0] if rows else 0,
-                "from": sorted({r[1] for r in rows if valid_name(r[1])})[:10]}
+        lost = self.stranded(user, sid)  # someone should hear about these, so they wake a watcher too
+        return {"unread": len(rows) + lost["count"], "latest": rows[-1][0] if rows else 0,
+                "from": sorted({r[1] for r in rows if valid_name(r[1])} | set(lost["from"]))[:10]}
 
     def unread(self, user: str, hold: bool = False, sid: str = "") -> tuple[list[dict], int]:
         """Up to CHECK_MAX_MESSAGES / CHECK_MAX_BYTES new messages, and how many more remain. With `hold` they
@@ -584,7 +599,7 @@ class Store:
             for m in rows:
                 ssid, rsid = self.db.execute("SELECT sender_sid,recipient_sid FROM messages WHERE id=?",
                                              (m["id"],)).fetchone()
-                if sid and m["recipient"] == user and rsid != sid:
+                if sid and m["recipient"] == user and not rsid:
                     self.db.execute("UPDATE messages SET recipient_sid=? WHERE id=?", (sid, m["id"]))
                     if ssid:
                         self.link(user, sid, m["sender"], ssid)
@@ -686,8 +701,11 @@ class Host:
             raise BCError(f"Daily limit reached ({SEND_PER_DAY} messages).")
         self.store.record_send(sender)
         self.store.touch(sender, sid)
-        # if this session is already in a conversation with one of their sessions, the message goes to that one
+        # if this session is already in a conversation with one of their sessions, the message goes to that one;
+        # if that session has closed, this starts a new conversation for whichever of their sessions reads it
         target = self.store.linked(sender, sid, to) if sid and to != "all" else ""
+        if target and target not in self.store.live_sessions(to):
+            target = ""
         return f"Sent message #{self.store.add(sender, to, body, sid, target)} to {to}."
 
     def peer_list(self) -> list[dict]:
@@ -809,13 +827,17 @@ class Host:
             if peer.status != "accepted":
                 return self._signed(nonce, {"error": "pending"}, 401)
             sid = as_sid(data.get("sid"))
+            self.store.touch(peer.name, sid)
             if op == "send":
                 return self._signed(nonce, {"result": self.send(peer.name, str(data.get("to", "")),
                                                                 str(data.get("body", "")), sid)})
             if op == "check":  # v0.3 clients send {} and are marked read at once; newer ones hold and ack
                 self.store.ack(peer.name, data.get("ack"), sid)
                 rows, more = self.store.unread(peer.name, hold=data.get("hold") is True, sid=sid)
-                return self._signed(nonce, {"messages": rows, "more": more})
+                return self._signed(nonce, {"messages": rows, "more": more,
+                                            "stranded": self.store.stranded(peer.name, sid, note=True)})
+            if op == "ping":
+                return self._signed(nonce, {"ok": True})
             if op == "ack":
                 self.store.ack(peer.name, data.get("id"), sid)
                 return self._signed(nonce, {"ok": True})
@@ -1315,6 +1337,17 @@ class Client:
         raise BCError(msg)
 
 
+def stranded_note(info: object) -> list[str]:
+    """Tell the user about messages stuck with a session of theirs that has closed. Validated: it may come from
+    the network."""
+    if not isinstance(info, dict) or not isinstance(info.get("count"), int) or info["count"] <= 0:
+        return []
+    who = [n for n in info.get("from") or [] if valid_name(n)] if isinstance(info.get("from"), list) else []
+    return [f"{info['count']} message(s){' from ' + ', '.join(who) if who else ''} were sent to another session of "
+            f"yours that has since closed. They belong to that conversation and aren't delivered here; use history "
+            f"to read them."]
+
+
 def checked_rows(rows: object) -> list[dict]:
     """Validate messages received from the host before they reach the agent."""
     out = []
@@ -1418,6 +1451,7 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
         if host:
             notes = await drain_pairing(ctx)
             rows, more = host.store.unread(NAME, sid=SESSION)
+            notes += stranded_note(host.store.stranded(NAME, SESSION, note=True))
             return "\n\n".join(notes + [deliver(rows, more)])
         kh = client.known()
         seen = client.seen(kh["key"]) if kh else 0
@@ -1431,7 +1465,7 @@ def build_mcp(role: str, ident: Identity, host: Host | None, client: Client | No
             client.mark_seen(kh["key"], max(ids))
             with contextlib.suppress(BCError):
                 await client.call(ctx, "ack", {"id": client.seen(kh["key"])})
-        return deliver(rows, more)
+        return "\n\n".join(stranded_note(r.get("stranded")) + [deliver(rows, more)])
 
     @mcp.tool()
     @guard
@@ -1555,6 +1589,19 @@ def make_host(ident: Identity) -> Host:
     return Host(ident, Store(DATA / "backchannel.db"), NAME, PORT)
 
 
+async def heartbeat(host: Host | None, client: Client | None) -> None:
+    """Tell the host this session is still open, so conversations locked to it are known to be reachable."""
+    while True:
+        with contextlib.suppress(Exception):
+            if host:
+                host.store.touch(NAME, SESSION)
+            elif client and (kh := client.known()) and not kh["declined"]:
+                info = await client.hello(kh["addr"], timeout=2.5)  # the pinned address only: never go looking
+                if info and info["key"] == kh["key"]:
+                    await client._post({**kh, "boot": info["boot"]}, "ping", {})
+        await asyncio.sleep(HEARTBEAT)
+
+
 async def run_stdio() -> None:
     prepare_data_dir()
     ident = Identity(DATA / "identity.json")
@@ -1569,14 +1616,18 @@ async def run_stdio() -> None:
                 log(f"relay stopped: {e!r}")
 
         async with asyncio.TaskGroup() as tg:
-            task = tg.create_task(relay())
+            tasks = [tg.create_task(relay()), tg.create_task(heartbeat(host, None))]
             await mcp.run_stdio_async()
-            task.cancel()
+            for task in tasks:
+                task.cancel()
     else:
         if ROLE != "client":
             log(f"unknown role '{ROLE}', acting as client")
         client = Client(ident, NAME, DATA, PORT, SESSION)
-        await build_mcp("client", ident, None, client).run_stdio_async()
+        async with asyncio.TaskGroup() as tg:
+            task = tg.create_task(heartbeat(None, client))
+            await build_mcp("client", ident, None, client).run_stdio_async()
+            task.cancel()
 
 
 def _say(line: str) -> None:

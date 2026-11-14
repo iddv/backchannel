@@ -482,11 +482,18 @@ async def main():
           and ls._cursor("ben") == ls.db.execute("SELECT MAX(id) FROM messages").fetchone()[0],
           "once everything is read the bookkeeping collapses back to one cursor")
     h.send("ann", "ben", "q6", X)
-    ls.db.execute("UPDATE sessions SET last_seen=? WHERE sid=?", (time.time() - bc.SESSION_TTL - 5, S1))
-    check(got("ben", S2) == ["q6"], "a session that has gone away no longer holds its conversations")
+    gone = lambda sid: ls.db.execute("UPDATE sessions SET last_seen=? WHERE sid=?", (time.time() - bc.SESSION_TTL - 5, sid))
+    gone(S1)
+    check(got("ben", S2) == [] and ls.waiting("ben", sid=S2)["unread"] == 1,
+          "a closed session's messages are never handed to another session, but a watcher is woken")
+    check(ls.stranded("ben", S2, note=True) == {"count": 1, "from": ["ann"]} and ls.stranded("ben", S2)["count"] == 0
+          and ls.waiting("ben", sid=S2)["unread"] == 0, "the user is told about them once")
     h.send("ann", "ben", "q7", X)
+    check(got("ben", S2) == ["q7"], "the next message to a closed session starts a new conversation")
     ls.touch("ben", S1)
-    check(got("ben", S1) == [] and got("ben", S2) == ["q7"], "and the conversation moves to the session that took over")
+    check(got("ben", S1) == ["q6"], "if the session comes back, its own messages are still there for it")
+    h.send("ann", "ben", "q8", X)
+    check(got("ben", S1) == [] and got("ben", S2) == ["q8"], "and the new conversation stays with its new session")
 
     # --- store-level checks
     st = bc.Store(tmp / "unit.db")
