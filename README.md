@@ -1,8 +1,22 @@
 # backchannel
 
-Let your friends' Claude Code agents pass messages and "try this" instructions to each other over a shared private network like ZeroTier or Tailscale.
+**Pass a note to your friend's coding agent.**
 
-One person hosts. Everyone else finds the host automatically. The client confirms the host, the host approves the client: one yes/no on each side.
+You're debugging over voice chat. "Tell sam to try bumping the timeout to 30s and rerun the tests." backchannel
+carries that to sam's Claude Code session, where the agent shows sam and asks before acting. The reply comes back to
+the exact session that asked.
+
+- **No cloud service, no accounts.** One of you hosts from a Claude Code session or a homelab box. Traffic stays on
+  the private network you already share: ZeroTier, Tailscale or a home LAN.
+- **Nothing spent while idle.** `/backchannel:watch` sleeps in the background and wakes your agent only when a
+  message arrives.
+- **You still call the shots.** A message is someone else's words, never an instruction. Your agent shows it and asks.
+- **Conversations don't get crossed.** With several sessions open, each one stays between the two that started it.
+- **Quick to set up.** One plugin install each, then two yes/no confirmations. Hosts are found automatically.
+- **Small enough to read.** One Python file, requests signed with a key per device, and a
+  [plain-language threat model](SECURITY.md).
+
+For small groups who trust each other, not for the open internet.
 
 ## Install
 
@@ -21,6 +35,9 @@ Choose a role and name when prompted:
 - **name**: use lowercase letters, digits and dashes. Defaults to your OS username. Choose a different name for each person.
 
 Restart Claude Code, or run `/reload-plugins`.
+
+To get new versions automatically, run `/plugin`, open **Marketplaces**, select `backchannel` and choose
+**Enable auto-update**. Otherwise update by hand with `/plugin` now and then.
 
 ### Host firewall
 
@@ -59,7 +76,7 @@ Confirm the host, then have the host approve the client as above.
 | `/backchannel:join <code\|ip\|ip:port>` | Connect manually |
 | `/backchannel:remove <name\|fingerprint>` | Remove or decline someone; host only |
 
-You can also say "tell sam to try bumping the timeout." Received requests are shown to you; your agent asks before acting.
+You rarely need the commands: "tell sam to try bumping the timeout" or "anything on the backchannel?" works too.
 
 ### Several sessions on one machine
 
@@ -119,7 +136,7 @@ Set these environment variables consistently for the server and management comma
 | `BACKCHANNEL_BIND` | `overlay`; prefer ZeroTier/Tailscale, fall back to private interfaces. Use `private` or comma-separated local IPs to override |
 | `BACKCHANNEL_PORT` | `8787`; TCP and UDP port |
 
-For small trusted groups on private networks. Don't expose it to the internet. See [SECURITY.md](SECURITY.md).
+Don't expose the port to the internet. See [SECURITY.md](SECURITY.md) for what is and isn't protected.
 
 ## Tests
 
