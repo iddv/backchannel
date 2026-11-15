@@ -120,7 +120,9 @@ def open_rows(ident: Identity, room: str, me: str, rows: list[dict], key_of: Cal
             o = unseal(ident, room, m["body"])
             if o["sender"] != (ident.pub if m["sender"] == me else key_of(m["sender"])):
                 raise SealError(f"it was signed by a key that isn't {m['sender']}'s current one")
-            if o["to"] != m["recipient"] or (o["to"] not in ("all", me) and m["sender"] != me):
+            # a conversation ("#id") is encrypted for exactly its members: opening it at all means being one
+            mine = o["to"] in ("all", me) or o["to"].startswith("#") or m["sender"] == me
+            if o["to"] != m["recipient"] or not mine:
                 raise SealError("it was addressed to someone else")
             out.append({**m, "ts": o["ts"], "body": o["text"], "ok": True})
         except SealError as e:

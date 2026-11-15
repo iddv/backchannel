@@ -123,7 +123,23 @@ class Store:
         """0.7: who has used a version that can read end-to-end encrypted messages."""
         self.db.execute("ALTER TABLE peers ADD COLUMN e2e INTEGER NOT NULL DEFAULT 0")
 
-    _MIGRATIONS = (_schema_1, _schema_2)
+    def _schema_3(self) -> None:
+        """0.8: conversations. Their messages live in `messages` with recipient '#<id>', which keeps them out of
+        everyone's ordinary inbox; who has been handed what is tracked per member here."""
+        ex = self.db.execute
+        ex(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, creator TEXT NOT NULL, created REAL NOT NULL, "
+            "expires REAL NOT NULL, rev INTEGER NOT NULL DEFAULT 1)"
+        )
+        # state: invited | joined | left. sid: the session that joined. seen: the last message handed to them
+        ex(
+            "CREATE TABLE conv_members (conv TEXT NOT NULL, user TEXT NOT NULL, state TEXT NOT NULL, "
+            "sid TEXT NOT NULL DEFAULT '', seen INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL, "
+            "PRIMARY KEY(conv, user))"
+        )
+        ex("CREATE INDEX messages_recipient_id ON messages(recipient, id)")
+
+    _MIGRATIONS = (_schema_1, _schema_2, _schema_3)
 
     def lock_down(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -372,7 +388,9 @@ class Store:
         return self.db.execute(f"SELECT COUNT(*) FROM messages {where}", args).fetchone()[0]
 
     def history(self, user: str, limit: int, with_user: str | None) -> list[dict]:
-        where, a = "WHERE id>? AND (recipient=? OR recipient='all' OR sender=?)", [self.joined_id(user), user, user]
+        # conversations ('#id') have their own way in; here they would show as one side's raw protocol messages
+        where = "WHERE id>? AND (recipient=? OR recipient='all' OR sender=?) AND recipient NOT LIKE '#%'"
+        a = [self.joined_id(user), user, user]
         if with_user:
             where += " AND (sender=? OR recipient=?)"
             a += [with_user, with_user]
@@ -383,7 +401,106 @@ class Store:
         cur = self.db.execute(f"SELECT id,ts,sender,recipient,body FROM messages {where}", args)
         return [dict(zip(("id", "ts", "sender", "recipient", "body"), r, strict=True)) for r in cur]
 
+    # conversations: a live exchange between named members, each taking part from one session. Membership is
+    # fixed when it starts. It ends at its time limit, or when everyone who joined has left.
+    def conv_create(self, conv: str, creator: str, sid: str, invited: list[str], minutes: float) -> bool:
+        now = time.time()
+        with self.tx():
+            if self.db.execute("SELECT 1 FROM conversations WHERE id=?", (conv,)).fetchone():
+                return False
+            self.db.execute(
+                "INSERT INTO conversations(id,creator,created,expires) VALUES(?,?,?,?)",
+                (conv, creator, now, now + minutes * 60),
+            )
+            rows = [(conv, creator, "joined", sid, now), *((conv, n, "invited", "", now) for n in invited)]
+            self.db.executemany("INSERT INTO conv_members(conv,user,state,sid,updated) VALUES(?,?,?,?,?)", rows)
+        return True
+
+    def conv(self, conv: str) -> dict | None:
+        r = self.db.execute("SELECT creator,expires,rev FROM conversations WHERE id=?", (conv,)).fetchone()
+        if not r:
+            return None
+        members = {
+            m[0]: {"state": m[1], "sid": m[2], "seen": m[3], "updated": m[4]}
+            for m in self.db.execute("SELECT user,state,sid,seen,updated FROM conv_members WHERE conv=?", (conv,))
+        }
+        over = time.time() >= r[1] or (
+            any(m["state"] == "left" for m in members.values())
+            and not any(m["state"] == "joined" for m in members.values())
+        )
+        return {"id": conv, "creator": r[0], "expires": r[1], "rev": r[2], "ended": over, "members": members}
+
+    def conv_set(self, conv: str, user: str, state: str, sid: str = "") -> None:
+        """A member joins or leaves. Bumps the revision, which is what tells waiting members something changed."""
+        with self.tx():
+            self.db.execute(
+                "UPDATE conv_members SET state=?, sid=?, updated=? WHERE conv=? AND user=?",
+                (state, sid, time.time(), conv, user),
+            )
+            self.db.execute("UPDATE conversations SET rev=rev+1 WHERE id=?", (conv,))
+
+    def conv_seen(self, conv: str, user: str, upto: int) -> None:
+        self.db.execute("UPDATE conv_members SET seen=MAX(seen,?) WHERE conv=? AND user=?", (upto, conv, user))
+
+    def conv_messages(self, conv: str, after: int, reader: str, limit: int) -> list[dict]:
+        """What others have said in the conversation since message id `after`."""
+        return self._rows(
+            "WHERE recipient=? AND id>? AND sender!=? ORDER BY id LIMIT ?", (f"#{conv}", after, reader, limit)
+        )
+
+    def conv_transcript(self, conv: str, after: int, limit: int, until: float | None = None) -> list[dict]:
+        """Everything said in the conversation, by anyone, after message id `after` (and up to time `until`)."""
+        where, args = "WHERE recipient=? AND id>?", [f"#{conv}", after]
+        if until is not None:
+            where, args = where + " AND ts<=?", [*args, until]
+        return self._rows(where + " ORDER BY id LIMIT ?", (*args, limit))
+
+    def conv_unread(self, user: str, sid: str, skip: tuple[str, ...] = ()) -> dict:
+        """Conversation messages not yet handed to this session, so a watcher can wake it."""
+        count, who = 0, set()
+        mine = self.db.execute(
+            "SELECT m.conv, m.seen FROM conv_members m JOIN conversations c ON c.id=m.conv "
+            "WHERE m.user=? AND m.state='joined' AND m.sid=? AND c.expires>?",
+            (user, sid, time.time()),
+        ).fetchall()
+        for conv, seen in mine:
+            if conv in skip:
+                continue
+            for (sender,) in self.db.execute(
+                "SELECT sender FROM messages WHERE recipient=? AND id>? AND sender!=? LIMIT 200",
+                (f"#{conv}", seen, user),
+            ):
+                count += 1
+                who.add(sender)
+        return {"count": count, "from": sorted(n for n in who if valid_name(n))[:10]}
+
+    def convs_for(self, user: str) -> list[dict]:
+        """Conversations `user` is invited to or taking part in that are still going."""
+        out = []
+        ids = self.db.execute(
+            "SELECT m.conv FROM conv_members m JOIN conversations c ON c.id=m.conv "
+            "WHERE m.user=? AND m.state!='left' AND c.expires>? ORDER BY c.created",
+            (user, time.time()),
+        ).fetchall()
+        for (cid,) in ids:
+            c = self.conv(cid)
+            if c and not c["ended"]:
+                me = c["members"][user]
+                unread = self.db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE recipient=? AND id>? AND sender!=?",
+                    (f"#{cid}", me["seen"], user),
+                ).fetchone()[0]
+                others = sorted(n for n in c["members"] if n != user)
+                out.append(
+                    {"id": cid, "state": me["state"], "sid": me["sid"], "with": others, "by": c["creator"]}
+                    | {"unread": unread}
+                )
+        return out
+
     def prune(self) -> None:
+        old = time.time() - RETENTION_DAYS * 86400
+        self.db.execute("DELETE FROM conv_members WHERE conv IN (SELECT id FROM conversations WHERE expires<?)", (old,))
+        self.db.execute("DELETE FROM conversations WHERE expires<?", (old,))
         self.db.execute("DELETE FROM sends WHERE ts<?", (time.time() - 86400,))
         self.db.execute("DELETE FROM messages WHERE ts<?", (time.time() - RETENTION_DAYS * 86400,))
         self.db.execute(

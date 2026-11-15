@@ -19,6 +19,31 @@ installed and signed in, and it adds a temporary MCP entry to the Gemini CLI's c
 
 Machine: a small homelab box (Linux), everything on loopback.
 
+### 0.8.0
+
+Pen test: 64 of 64 checks passed, 13 of them new attacks on conversations. The first run failed one: six
+simultaneous listens from one key got five through a cap of four, because the count was checked and raised on
+either side of a database call. Fixed, and it has passed since.
+
+| Load test | Result |
+|---|---|
+| From one member saying something to a listening member having it | 2.8 ms (worst of 20: 3.2 ms) |
+| Messages said in a conversation per second, 8 connections | 586 |
+| Listens that find nothing new, per second, 8 connections | 675 |
+| Sends per second, 8 connections | 497 |
+| Inbox checks per second, 8 connections, 3,000 other people's messages above an unacknowledged one | 698 |
+| 32 watchers woken by one broadcast | all within 19 ms |
+| Host CPU with 32 idle watchers | 0.9 % of one core |
+| Host memory | 44 to 53 MB |
+
+The inbox-check case that dropped to 262 in 0.7.0 is back above its 0.5.0 figure: conversations brought an index on
+recipient and message id, which that query uses too.
+
+Two-agent runs (`scripts/agents/conversation/`): a Codex host and a Gemini client paired, held a conversation,
+wrote shared notes and left. Their first run found that a member's own conversation messages showed up raw in
+`history`, that a wait woken by a join or a note also claimed "nothing new", and that a long backlog could be
+skipped past; all fixed.
+
 ### 0.7.0
 
 Pen test: 52 of 52 checks passed.

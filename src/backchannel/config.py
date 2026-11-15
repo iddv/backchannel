@@ -44,6 +44,12 @@ REBIND_EVERY = 15  # how often the host looks for changed interfaces / a freed p
 HEARTBEAT = 60  # every session tells the host it is still open this often
 SESSION_TTL = 180  # a session silent for this long is treated as closed
 SID_RE = re.compile(r"[0-9a-f]{12}")
+CONV_RE = re.compile(r"[0-9a-f]{8}")  # a conversation's id; its messages are addressed to "#<id>"
+CONV_MINUTES = 30  # how long a conversation lasts unless its starter says otherwise
+CONV_MAX_MINUTES = 240
+CONV_MAX_MEMBERS = 16
+CONV_PAGE = 30  # messages one say/listen hands over
+CONV_MAX_OPEN = 20  # conversations one person can have going at once
 OVERLAY_PREFIXES = ("zt", "feth", "tailscale")
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
@@ -56,6 +62,12 @@ def _env(name: str, default: str = "") -> str:
 
 def valid_name(n: object) -> bool:
     return isinstance(n, str) and bool(NAME_RE.fullmatch(n)) and n != "all" and not FP_LIKE_RE.fullmatch(n)
+
+
+def as_conv(v: object) -> str:
+    """A conversation id from the network or the agent ('#' in front is fine), or ''."""
+    v = v.strip().lstrip("#").lower() if isinstance(v, str) else ""
+    return v if CONV_RE.fullmatch(v) else ""
 
 
 def as_sid(v: object) -> str:

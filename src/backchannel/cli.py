@@ -137,7 +137,10 @@ async def wait_host(cfg: Config) -> int:
     def poll(touch: bool) -> tuple[dict, list[str]]:
         if touch:
             store.touch(cfg.name, cfg.session)
-        return store.waiting(cfg.name, sid=cfg.session), fresh_requests()
+        waiting, conv = store.waiting(cfg.name, sid=cfg.session), store.conv_unread(cfg.name, cfg.session)
+        waiting["unread"] += conv["count"]
+        waiting["from"] = sorted({*waiting["from"], *conv["from"]})
+        return waiting, fresh_requests()
 
     parent, touched = _launcher(), float("-inf")
     while _launcher() == parent:

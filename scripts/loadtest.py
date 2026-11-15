@@ -225,6 +225,44 @@ async def net_bench(server):
     c1 = peers[1].client()
     await blast("check, 3000 unread (20/page)", 150, 1, lambda i: peers[1].post(c1, hello, "check", {"sid": "d" * 12}))
 
+    print("\n3b. Conversations")
+    A, B = {"sid": "a" * 12}, {"sid": "b" * 12}
+    await peers[0].post(c0, hello, "conv", {"op": "start", "conv": "c0ffee00", "members": ["p1"], **A})
+    rev = (await peers[1].post(c1, hello, "conv", {"op": "join", "conv": "c0ffee00", **B})).json()["rev"]
+    line_ = seal(peers[0].ident, hello["key"], "#c0ffee00", [peers[1].ident.pub], '{"say": "' + "x" * 200 + '"}')
+    last = (await peers[0].post(c0, hello, "conv", {"op": "say", "conv": "c0ffee00", "body": line_, **A})).json()[
+        "sent"
+    ]
+    lat = []
+    for _ in range(20):  # how long between one side saying something and a listening member having it
+        heard = asyncio.create_task(
+            peers[1].post(c1, hello, "conv_wait", {"conv": "c0ffee00", "after": last, "rev": rev, "timeout": 20, **B})
+        )
+        await asyncio.sleep(0.15)
+        t = time.perf_counter()
+        last = (await peers[0].post(c0, hello, "conv", {"op": "say", "conv": "c0ffee00", "body": line_, **A})).json()[
+            "sent"
+        ]
+        assert (await heard).json()["messages"]
+        lat.append(time.perf_counter() - t)
+    print(f"  say -> the listener has it          p50 {pct(lat, 0.5):6.1f} ms  max {max(lat) * 1000:6.1f} ms")
+    await blast(
+        "say in a conversation (sealed)",
+        3000,
+        8,
+        lambda i: peers[0].post(
+            c0, hello, "conv", {"op": "say", "conv": "c0ffee00", "body": line_, "after": 10**9, **A}
+        ),
+    )
+    await blast(
+        "listen, nothing new, timeout=0",
+        3000,
+        8,
+        lambda i: peers[1].post(
+            c1, hello, "conv_wait", {"conv": "c0ffee00", "after": 10**9, "rev": rev, "timeout": 0, **B}
+        ),
+    )
+
     print("\n4. Watchers again, now with 3000 messages in the store that aren't theirs")
     tasks, clients = await waiters(peers[2:], hello, 4, 20)
     await asyncio.sleep(2)

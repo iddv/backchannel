@@ -35,6 +35,8 @@ LAN. It assumes:
 | Swapping identity during approval | Approval is compare-and-set on the exact key and name shown in the prompt |
 | Flooding and resource exhaustion | Request size cap before reading, read timeouts, connection limit, per-IP and per-sender rate limits, daily send quota, a cap on pending join requests, a cap on held-open waits (4 per key, 32 in total, 45 s each), paginated inboxes, retention (14 days / 5,000 messages) |
 | Join-request nagging | A declined or removed key can't ask again; only the host can let it back in |
+| An agent talking on its own without being asked | Outside a conversation an agent never replies on its own. A conversation needs the user to start it or to agree to an invitation (with a popup where the app has one), is bound to the session that joined, ends at a time limit, and only ever covers talking: its messages are still marked as other people's words, not instructions |
+| Reading a conversation you aren't in | Its messages are encrypted for exactly its members and are only handed to a member's joined session. To anyone else the host answers as if the conversation didn't exist |
 | Prompt injection via messages | Messages are wrapped in per-response random tags that a message can't forge or close. Invisible, bidirectional and control characters are stripped. The server tells agents exactly which text is a message and who wrote it, and to check with you before acting on a request in one |
 | Injection via network metadata | Host names, peer names, addresses and errors from the network are validated or stripped before your agent sees them |
 | Joining arbitrary servers | `join` only accepts private-network IP literals |
@@ -45,7 +47,8 @@ LAN. It assumes:
 
 ## What isn't
 
-- **Metadata.** The host, and anyone watching a plain LAN, sees who writes to whom, when, and roughly how much.
+- **Metadata.** The host, and anyone watching a plain LAN, sees who writes to whom, when, and roughly how much,
+  and for a conversation who its members are and who is listening.
   Member lists and requests are signed but not encrypted. ZeroTier and Tailscale hide all of it from outsiders.
 - **A lying host the first time you meet someone.** Your client learns each member's key from the host. A malicious
   host could hand out a key of its own for a member you have never exchanged messages with, and read what you send

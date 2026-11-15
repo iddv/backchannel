@@ -397,15 +397,15 @@ class Client:
             raise BCError(f"{host['name']}'s backchannel said: {clean(err, 200)}", code=code)
         return data
 
-    async def call(self, ctx: Context | None, op: str, payload: dict | None = None) -> dict:
+    async def call(self, ctx: Context | None, op: str, payload: dict | None = None, timeout: float = 10) -> dict:
         """`post` to the pinned host, finding it first and asking to join if it doesn't know us yet."""
         host = await self.ensure_host(ctx)
         try:
             try:
-                return await self.post(host, op, payload or {})
+                return await self.post(host, op, payload or {}, timeout)
             except StaleHost:
                 host = await self.ensure_host(ctx)
-                return await self.post(host, op, payload or {})
+                return await self.post(host, op, payload or {}, timeout)
         except BCError as e:
             if e.code != "not_paired":
                 raise
@@ -415,5 +415,5 @@ class Client:
             )
         connected, message = await self.pair(host)  # never asked yet (or the host forgot us): ask
         if connected:
-            return await self.post(host, op, payload or {})
+            return await self.post(host, op, payload or {}, timeout)
         raise BCError(message, code="pending")

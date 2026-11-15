@@ -25,6 +25,11 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .config import (
     CGNAT,
     CLOCK_SKEW_MS,
+    CONV_MAX_MEMBERS,
+    CONV_MAX_MINUTES,
+    CONV_MAX_OPEN,
+    CONV_MINUTES,
+    CONV_PAGE,
     MAX_BODY,
     MAX_PENDING,
     MAX_REQUEST,
@@ -40,6 +45,7 @@ from .config import (
     WAIT_TOTAL,
     BCError,
     Reject,
+    as_conv,
     as_sid,
     log,
     valid_name,
@@ -103,6 +109,8 @@ class Host:
         self.nets: list[ipaddress.IPv4Network] = []
         self.serving = False  # is *this* process the one holding the port?
         self.waits: dict[str, int] = defaultdict(int)
+        self.listening: dict[tuple[str, str], int] = defaultdict(int)  # (conversation, member): open waits
+        self.arriving: dict[tuple[str, str], float] = {}  # said something and is about to wait: until when
         self.bell: asyncio.Event | None = None  # rung on every send, so long-polls answer at once
         self.app = Starlette(
             routes=[
@@ -139,10 +147,7 @@ class Host:
             raise BCError("Message is empty.")
         if len(body.encode()) > (MAX_SEALED if is_sealed(body) else MAX_BODY):
             raise BCError(f"Message too long (max {MAX_BODY // 1024} KiB).")
-        if not self.limiter.ok(f"send:{sender}", SEND_PER_MINUTE, 60):
-            raise BCError(f"Rate limit: at most {SEND_PER_MINUTE} messages a minute.")
-        if self.store.sent_since(sender, 86400) >= SEND_PER_DAY:
-            raise BCError(f"Daily limit reached ({SEND_PER_DAY} messages).")
+        self._may_send(sender)
         # if this session is already in a conversation with one of their sessions, the message goes to that one;
         # if that session has closed, this starts a new conversation for whichever of their sessions reads it
         target = self.store.linked(sender, sid, to) if sid and to != "all" else ""
@@ -153,6 +158,134 @@ class Host:
             self.store.touch(sender, sid)
             msg_id = self.store.add(sender, to, body, sid, target)
         return f"Sent message #{msg_id} to {to}."
+
+    def _may_send(self, sender: str) -> None:
+        if not self.limiter.ok(f"send:{sender}", SEND_PER_MINUTE, 60):
+            raise BCError(f"Rate limit: at most {SEND_PER_MINUTE} messages a minute.")
+        if self.store.sent_since(sender, 86400) >= SEND_PER_DAY:
+            raise BCError(f"Daily limit reached ({SEND_PER_DAY} messages).")
+
+    # conversations (blocking, like the operations above)
+    def _conv(self, conv: object, user: str, sid: str = "", joined: bool = True) -> dict:
+        """The conversation, if `user` may act in it. Not being a member looks the same as it not existing."""
+        c = self.store.conv(as_conv(conv))
+        me = c["members"].get(user) if c else None
+        if not me or me["state"] == "left":
+            raise BCError("There is no such conversation, or you aren't part of it.")
+        if c["ended"]:
+            raise BCError("That conversation has ended.")
+        if joined and me["state"] != "joined":
+            raise BCError("You have been invited to that conversation but haven't joined it yet.")
+        if joined and me["sid"] != sid:
+            raise BCError("That conversation is open in another of your sessions.")
+        return c
+
+    def _heard(self, conv: str) -> set[str]:
+        """Who is listening in the conversation: an open wait, or one that is just about to open."""
+        now = time.monotonic()
+        soon = {u for (c, u), until in list(self.arriving.items()) if c == conv and until > now}
+        return {u for c, u in list(self.listening) if c == conv} | soon
+
+    def _conv_view(self, conv: str, user: str, after: int = 0, fetch: bool = True) -> dict:
+        """What a member gets back from every conversation call: what others said since `after`, and who is
+        where. Handing messages over marks them seen, so a watcher doesn't announce them a second time."""
+        rows = self.store.conv_messages(conv, after, user, CONV_PAGE) if fetch else []
+        self.store.conv_seen(conv, user, rows[-1]["id"] if rows else after)
+        c, heard, now = self.store.conv(conv), self._heard(conv), time.time()
+        members = [
+            {"name": n, "state": m["state"], "listening": n in heard, "quiet": int(now - m["updated"])}
+            for n, m in sorted(c["members"].items())
+        ]
+        return {"messages": rows, "rev": c["rev"], "ended": c["ended"], "left": int(c["expires"] - now)} | {
+            "members": members
+        }
+
+    def conv_op(self, op: str, user: str, sid: str, data: dict) -> dict:
+        """One conversation request from `user`'s session `sid`."""
+        after = data.get("after")
+        after = after if isinstance(after, int) and not isinstance(after, bool) and after > 0 else 0
+        if op == "list":
+            return {"conversations": self.store.convs_for(user)}
+        if not sid:
+            raise BCError("Conversations need backchannel 0.8 or later.")
+        if op == "start":
+            conv, names = as_conv(data.get("conv")), data.get("members")
+            if not conv or not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise ValueError
+            names = sorted({n.strip().lower() for n in names} - {user})
+            able = self.known_names() - ({self.name} if self.relay else set())
+            unknown = [clean(n, 30) for n in names if n not in able]
+            if unknown or not names:
+                raise BCError(f"Can't start a conversation with: {', '.join(unknown) or 'nobody'}.")
+            if len(names) >= CONV_MAX_MEMBERS:
+                raise BCError(f"A conversation can have at most {CONV_MAX_MEMBERS} members.")
+            if sum(c["by"] == user for c in self.store.convs_for(user)) >= CONV_MAX_OPEN:
+                raise BCError(f"You already have {CONV_MAX_OPEN} conversations going; leave some first.")
+            minutes = data.get("minutes", CONV_MINUTES)
+            if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or math.isnan(minutes):
+                minutes = CONV_MINUTES
+            if not self.store.conv_create(conv, user, sid, names, min(max(minutes, 1), CONV_MAX_MINUTES)):
+                raise BCError("That conversation id is already used; start it again.")
+            return self._conv_view(conv, user)
+        if op == "join":
+            c = self._conv(data.get("conv"), user, joined=False)
+            me = c["members"][user]
+            if me["state"] == "joined" and me["sid"] != sid and me["sid"] in self.store.live_sessions(user):
+                raise BCError("That conversation is open in another of your sessions.")
+            self.store.conv_set(c["id"], user, "joined", sid)
+            return self._conv_view(c["id"], user, fetch=False)
+        if op == "leave":
+            c = self._conv(data.get("conv"), user, joined=False)
+            self.store.conv_set(c["id"], user, "left")
+            return {"ok": True}
+        if op == "read":
+            # looking back: open to anyone who was in it, also after it ended. Someone who left sees what was
+            # said up to then, not what the others went on to say
+            c = self.store.conv(as_conv(data.get("conv")))
+            me = c["members"].get(user) if c else None
+            if not me or me["state"] == "invited":
+                raise BCError("There is no such conversation, or you aren't part of it.")
+            until = me["updated"] if me["state"] == "left" else None
+            rows = self.store.conv_transcript(c["id"], after, CONV_PAGE, until)
+            members = [{"name": n, "state": m["state"]} for n, m in sorted(c["members"].items())]
+            return {"messages": rows, "ended": c["ended"], "members": members}
+        if op == "say":
+            c, body, sent = self._conv(data.get("conv"), user, sid), data.get("body"), 0
+            if body is not None:
+                if not is_sealed(body) or len(body) > MAX_SEALED:
+                    raise BCError("That message isn't a valid encrypted message.")
+                self._may_send(user)
+                with self.store.tx():
+                    self.store.record_send(user)
+                    sent = self.store.add(user, f"#{c['id']}", body, sid)
+                if data.get("wait") is True:  # they will be listening by the time anyone reads this
+                    self.arriving[(c["id"], user)] = time.monotonic() + 3
+            return self._conv_view(c["id"], user, after) | {"sent": sent}
+        raise BCError("Unknown conversation request.")
+
+    def _conv_wait_poll(self, user: str, sid: str, conv: object, after: int) -> dict:
+        c = self._conv(conv, user, sid)
+        self.store.touch(user, sid)
+        return self._conv_view(c["id"], user, after)
+
+    async def conv_wait(self, user: str, sid: str, conv: object, after: int, rev: object, hold: float, alive=None):
+        """Hold until someone says something in the conversation, joins or leaves it, it ends, or `hold` seconds
+        pass. While this is open the member shows as listening. Raises BCError if they may not."""
+        key, deadline = (as_conv(conv), user), time.monotonic() + hold
+        self.listening[key] += 1
+        try:
+            while True:
+                out = await self.db(self._conv_wait_poll, user, sid, conv, after)
+                done = out["messages"] or out["rev"] != rev or out["ended"] or time.monotonic() >= deadline
+                if done or (alive is not None and not await alive()):
+                    return out
+                self.bell = self.bell or asyncio.Event()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.bell.wait(), 1)
+        finally:
+            self.listening[key] -= 1
+            if self.listening[key] <= 0:
+                self.listening.pop(key, None)
 
     def peer_list(self) -> list[dict]:
         """Everyone on the backchannel, with their keys. `e2e` says whether they have a version that can read
@@ -168,13 +301,22 @@ class Host:
     def inbox(self, user: str, sid: str, hold: bool = False, ack: object = None) -> dict:
         self.store.ack(user, ack, sid)
         rows, more = self.store.unread(user, hold=hold, sid=sid)
-        return {"messages": rows, "more": more, "stranded": self.store.stranded(user, sid, note=True)}
+        # conversations this session should hear about: invitations, and its own with something unheard
+        convs = [
+            {k: c[k] for k in ("id", "state", "with", "by", "unread")}
+            for c in self.store.convs_for(user)
+            if c["state"] == "invited" or (c["sid"] == sid and c["unread"])
+        ]
+        return {"messages": rows, "more": more, "stranded": self.store.stranded(user, sid, note=True)} | {
+            "conversations": convs
+        }
 
     def maintain(self) -> None:
         self.store.prune()
         self.store.expire_pending()
         self.store.lock_down()
         self.limiter.gc()
+        self.arriving = {k: t for k, t in self.arriving.items() if t > time.monotonic()}
         cutoff = time.monotonic() - 3600
         self._touched = {k: t for k, t in self._touched.items() if t > cutoff}
 
@@ -281,8 +423,10 @@ class Host:
         op, sid = req.path_params["op"], as_sid(data.get("sid"))
         if op == "wait":
             return await self._wait(req, nonce, key, data, sid)
+        if op == "conv_wait":
+            return await self._conv_wait_http(req, nonce, key, data, sid)
         status, payload = await self.db(self._handle, op, key, data, req.client.host, sid)
-        if op == "send" and status == 200:
+        if op in ("send", "conv") and status == 200:
             self.ring()
         return self._signed(nonce, payload, status)
 
@@ -357,7 +501,11 @@ class Host:
     def _op_peers(self, peer: Peer, data: dict, sid: str) -> dict:
         return {"peers": self.peer_list()}
 
+    def _op_conv(self, peer: Peer, data: dict, sid: str) -> dict:
+        return self.conv_op(str(data.get("op", "")), peer.name, sid, data)
+
     _OPS = {
+        "conv": _op_conv,
         "send": _op_send,
         "check": _op_check,
         "ack": _op_ack,
@@ -375,7 +523,12 @@ class Host:
         if now - self._touched.get((peer.name, sid), float("-inf")) >= 20:  # a watcher is alive; say so sparingly
             self._touched[(peer.name, sid)] = now
             self.store.touch(peer.name, sid)
-        return 200, self.store.waiting(peer.name, after, sid)
+        out = self.store.waiting(peer.name, after, sid)
+        # conversation messages this session isn't already listening for wake it too
+        conv = self.store.conv_unread(peer.name, sid, tuple(c for c, u in list(self.listening) if u == peer.name))
+        out["unread"] += conv["count"]
+        out["from"] = sorted({*out["from"], *conv["from"]})[:10]
+        return 200, out
 
     async def _wait(self, req: Request, nonce: str, key: str, data: dict, sid: str) -> Response:
         """Long-poll: answer as soon as this session has unread messages newer than `after`, or after WAIT_HOLD
@@ -402,6 +555,36 @@ class Host:
                 self.bell = self.bell or asyncio.Event()
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.bell.wait(), 1)
+        finally:
+            self.waits[key] -= 1
+            if self.waits[key] <= 0:
+                self.waits.pop(key, None)
+
+    async def _conv_wait_http(self, req: Request, nonce: str, key: str, data: dict, sid: str) -> Response:
+        """The long-poll behind a blocking say or listen."""
+        status, payload = await self.db(self._handle, "ping", key, data, req.client.host, sid)  # standing, heartbeat
+        if status != 200:
+            return self._signed(nonce, payload, status)
+        name = (await self.db(self.store.peer, key)).name
+        hold, after = data.get("timeout", WAIT_HOLD), data.get("after")
+        if isinstance(hold, bool) or not isinstance(hold, (int, float)) or math.isnan(hold):
+            hold = WAIT_HOLD
+        after = after if isinstance(after, int) and not isinstance(after, bool) and after > 0 else 0
+
+        async def alive() -> bool:
+            return self.serving and not await req.is_disconnected()
+
+        # nothing may be awaited between counting the open waits and adding this one to them
+        if self.waits[key] >= WAIT_PER_PEER or sum(self.waits.values()) >= WAIT_TOTAL:
+            return self._signed(nonce, {"error": "too_many_waits"}, 429)
+        self.waits[key] += 1
+        try:
+            out = await self.conv_wait(
+                name, sid, data.get("conv"), after, data.get("rev"), min(max(hold, 0), WAIT_HOLD), alive
+            )
+            return self._signed(nonce, out)
+        except BCError as e:
+            return self._signed(nonce, {"error": str(e)}, 422)
         finally:
             self.waits[key] -= 1
             if self.waits[key] <= 0:

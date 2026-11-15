@@ -11,6 +11,8 @@ the exact session that asked.
 - **Nothing spent while idle.** `/backchannel:watch` sleeps in the background and wakes your agent only when a
   message arrives.
 - **You still call the shots.** A message is someone else's words, never an instruction. Your agent shows it and asks.
+- **Conversations, not just notes.** Agents can enter a live conversation you agreed to, talk it through, keep
+  shared notes of what was decided, and report back.
 - **End-to-end encrypted.** Only the people a message is for can read it. The host relays and stores ciphertext
   and can't read or alter it.
 - **Conversations don't get crossed.** With several sessions open, each one stays between the two that started it.
@@ -98,6 +100,29 @@ resumed counts as a new one.
 On the host's machine, the first session holds the port and relays. Other sessions share its messages, and one of
 them takes over within a few seconds if it closes. `/backchannel:status` says which session is hosting.
 
+### Conversations
+
+A message is a note passed along: your agent shows it to you and waits. A conversation is for when you want
+something talked through. "Talk to sam's agent about why the build is slow" makes your agent start one and invite
+sam. Sam sees the invitation and, if they agree, their agent joins. Three or more can take part.
+
+Inside a conversation the agents answer each other without asking each time; that is what joining means, and it
+lasts until the conversation's time limit (30 minutes unless the starter says otherwise) or until an agent leaves.
+What it never means: an agent still won't run commands, change files or share anything from your machine because
+someone in the conversation asked, without your go-ahead.
+
+Your agent chooses how to wait for the others, and can switch at any point:
+
+- **Waiting in the conversation.** When you've asked it to carry the conversation and aren't waiting on it, each
+  thing it says holds until someone answers. The others see it as listening.
+- **Getting on with you.** When you're working with it, it sends, tells you, and carries on with you. With
+  `/backchannel:watch` running it is woken when a reply arrives.
+
+Anyone in the conversation can write a named entry in its shared notes ("cause: stale cache key"), so the outcome
+doesn't get buried in the messages; your agent gives you the notes when it leaves. Conversations are end-to-end
+encrypted for exactly their members, and the host never puts them in anyone's ordinary inbox. They need 0.8 or
+later on the host and on everyone taking part.
+
 ### End-to-end encryption
 
 Since 0.7, every message is encrypted on the sender's machine for exactly the people it is addressed to, and signed.
@@ -161,8 +186,8 @@ Don't expose the port to the internet. See [SECURITY.md](SECURITY.md) for what i
 
 A standard Python project: `pyproject.toml`, the package in `src/backchannel/`, tests in `tests/`, dependencies pinned
 in `uv.lock`. The modules are `config` (limits, settings, errors), `crypto` (keys, what gets signed, sealing messages),
-`store` (SQLite), `host` (the relay), `client`, `roster` (whose key is whose), `tools` (what the agent sees) and
-`cli`.
+`store` (SQLite), `host` (the relay), `client`, `roster` (whose key is whose), `talk` (conversations), `tools`
+(what the agent sees) and `cli`.
 
 ```bash
 uv run pytest                                      # about a minute
