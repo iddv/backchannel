@@ -237,7 +237,9 @@ async def hook(event: str, app: str) -> int:
     never get in the user's way, so anything unexpected ends quietly."""
     given = _stdin()
     silent = "{}" if app == "gemini" else ""  # Gemini wants JSON back even when there is nothing to say
-    entry = find(patience=8 if event in ("session-start", "wake") else 0)
+    # at session start the server may still be starting (its first run after an update installs it), and the
+    # waker runs in the background, so it can afford to wait for it
+    entry = find(patience={"wake": 180, "session-start": 8}.get(event, 0))
     if entry is None:
         print(silent, end="")
         return 0
