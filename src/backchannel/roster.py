@@ -39,15 +39,21 @@ def readers(roster: dict[str, Member], me: str, to: str) -> list[Member]:
     """The people a message to `to` is for (not counting the sender)."""
     if to == "all":
         return [m for m in roster.values() if m.name != me and not m.relay]
+    if to == me:
+        raise BCError("That is your own name; pick someone else, or 'all'.")
     if to not in roster:
-        raise BCError(f"Unknown recipient '{to[:30]}'. Known: all, {', '.join(sorted(roster))}.")
+        others = sorted(n for n in roster if n != me)
+        raise BCError(f"Unknown recipient '{to[:30]}'. Known: {', '.join(['all', *others])}.")
     if roster[to].relay:
         raise BCError(f"'{to}' is a headless host; nobody reads messages there.")
     return [roster[to]]
 
 
-def behind(for_: list[Member]) -> str:
-    """What to tell a sender about readers who are still on a version that can't decrypt."""
+def behind(for_: list[Member], to: str) -> str:
+    """What to tell a sender about a message that won't be read yet: nobody is there, or readers are still on a
+    version that can't decrypt."""
+    if to == "all" and not for_:
+        return " Nobody else is on the backchannel yet, so nobody will get it."
     names = sorted(m.name for m in for_ if not m.e2e)
     return f" {', '.join(names)} can't read it until they update to backchannel 0.7." if names else ""
 

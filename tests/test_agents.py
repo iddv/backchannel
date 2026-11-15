@@ -124,6 +124,7 @@ async def test_client_side_protections(tmp_path):
         assert "isn't an IP address" in await bob.call("join_host", address="evil.example:8787/x#")
         out = await bob.call("join_host", address=f"bc1:127.0.0.1:{w.port}:AAAA-BBBB-CCCC-DDDD")
         assert "doesn't match the invite" in out and host_fp not in out  # refused without leaking the real key
+        bob.answers.append("decline")
         out = await bob.call("join_host", address=f"bc1:127.0.0.1:{w.port}:{host_fp}")
         assert "matches the invite code" in bob.prompts[-1] and "Not connecting" in out  # still the user's call
 
@@ -262,3 +263,26 @@ def test_headless_cli(tmp_path):
     assert r.returncode != 0 and "nobody matches" in r.stderr
     assert "usage: peers" in run("peers", "accept").stderr
     assert "stdio MCP server" in run("bogus").stderr
+
+
+async def test_an_app_that_cannot_show_its_popups_can_still_pair(tmp_path):
+    """Some apps say they support popups and then close every one unanswered (a headless run does). That is not
+    a no: the tools take over, and a second explicit call is the user's decision."""
+    async with world(tmp_path) as w:
+        host, sam = await w.agent("host", "iddv"), await w.agent("client", "sam")  # every popup is cancelled
+        code = f"bc1:127.0.0.1:{w.port}:{w.host_fp()}"
+        out = await sam.call("join_host", address=code)
+        assert "closed without an answer" in out and f"join_host(address='{code}')" in out
+        assert "Pairing request sent" in await sam.call("join_host", address=code)
+        assert len(sam.prompts) == 1  # not asked again
+
+        out = await host.call("check_messages")
+        assert "Pairing request: 'sam' wants to join" in out and "accept_peer(" in out
+        assert "can now use" in await host.call("accept_peer", fingerprint=await sam.key(), name="sam")
+        assert len(host.prompts) == 1
+        assert "iddv accepted you" in await sam.call("check_messages")
+        assert "accepted you" not in await sam.call("check_messages")  # said once
+        assert "your own name" in await sam.call("send_message", to="sam", message="hello me")
+        assert "Known: all, iddv." in await sam.call("send_message", to="nobody", message="x")
+        assert (await sam.call("send_message", to="iddv", message="made it")).startswith("Sent")
+        assert "made it" in await host.call("check_messages")

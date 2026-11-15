@@ -10,6 +10,11 @@ uv run python scripts/loadtest.py   # about two minutes
 
 Both start their own host on loopback and leave your real backchannel alone.
 
+`scripts/agents/run.sh [minutes] [brief-directory] [output-directory]` puts two other vendors' agents on a private
+loopback backchannel (Codex as host, Gemini's `agy` as client) and collects what they report. The briefs in
+`scripts/agents/discussion/` ask them to discuss, over the backchannel, how it should change. It needs both CLIs
+installed and signed in, and it adds a temporary MCP entry to the Gemini CLI's config for the length of the run.
+
 ## Results on record
 
 Machine: a small homelab box (Linux), everything on loopback.

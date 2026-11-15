@@ -47,6 +47,8 @@ class Client:
         self.seen_file = data_dir / "seen.json"
         self.last_scan = 0.0
         self._http: httpx.AsyncClient | None = None
+        self.unasked: set[str] = set()  # host keys whose confirmation popup came back unanswered
+        self.waiting_on = ""  # the host we were last told is still deciding about us
 
     def http(self) -> httpx.AsyncClient:
         """One HTTP client for the life of this object. verify=False only skips loading the CA bundle: every URL
@@ -243,7 +245,8 @@ class Client:
             f"backchannel: {how} '{info['name']}' at {info['addr']}, host key {info['fp']} ({check}). "
             f"Connect and ask to join?"
         )
-        if ctx is not None and can_elicit(ctx):
+        code = f"bc1:{info['addr']}:{info['fp']}"
+        if ctx is not None and can_elicit(ctx) and not (invite and info["key"] in self.unasked):
             try:
                 r = await ctx.elicit(message=question, schema=Confirm)
             except Exception as e:
@@ -251,12 +254,21 @@ class Client:
             else:
                 if r.action == "accept" and r.data.ok:
                     return
-                raise BCError("Not connecting to that host.")
+                if r.action != "cancel":
+                    raise BCError(f"Not connecting: the user said no to '{info['name']}' at {info['addr']}.")
+                # dismissed, or the app can't show popups (a headless run): nobody answered. A second explicit
+                # join with the invite code is then the user's yes, as it is where there are no popups at all
+                self.unasked.add(info["key"])
+                raise BCError(
+                    f"Not connected: the question about '{info['name']}' at {info['addr']} (host key "
+                    f"{info['fp']}) was closed without an answer. Ask your user whether to connect; if they "
+                    f"agree, call join_host(address='{code}') once more: that second call counts as their yes."
+                )
         if invite:  # no popup available: an explicit join with the matching invite code is the user's yes
             return
         raise BCError(
             f"{how.capitalize()} '{info['name']}' at {info['addr']} (host key {info['fp']}). Ask your user "
-            f"whether to connect; if they agree, call join_host(address='bc1:{info['addr']}:{info['fp']}')."
+            f"whether to connect; if they agree, call join_host(address='{code}')."
         )
 
     async def ensure_host(self, ctx: Context | None = None, sweep: bool = True) -> dict:
@@ -315,9 +327,10 @@ class Client:
         r = await self.post(host, "pair", {"name": self.name})
         if r.get("status") == "accepted":
             return True, f"Connected to {host['name']}'s backchannel as {self.name}."
+        self.waiting_on = host["name"]
         return False, (
             f"Pairing request sent to {host['name']} (their key {host['fp']}). Waiting for them to accept; "
-            f"your key is {self.ident.fp}. Try again once they have."
+            f"your key is {self.ident.fp}. check_messages will say when they have."
         )
 
     _ERRORS = {
@@ -378,6 +391,8 @@ class Client:
             if code in self._ERRORS:
                 if code == "declined":
                     self.pin(host, declined=True)
+                if code == "pending":
+                    self.waiting_on = host["name"]
                 raise BCError(self._ERRORS[code].format(host=host["name"], fp=self.ident.fp, me=self.name), code=code)
             raise BCError(f"{host['name']}'s backchannel said: {clean(err, 200)}", code=code)
         return data

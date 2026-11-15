@@ -71,9 +71,20 @@ def guard(fn):
     return wrapper
 
 
+def tool(mcp: FastMCP):
+    """Register a tool: its docstring becomes the description as one clean paragraph, and its errors meant for
+    the user come back as text."""
+
+    def register(fn):
+        return mcp.tool(description=" ".join(fn.__doc__.split()))(guard(fn))
+
+    return register
+
+
 class HostBackend:
     def __init__(self, cfg: Config, host: Host) -> None:
         self.cfg, self.host = cfg, host
+        self.unasked: set[str] = set()  # keys whose join popup came back unanswered
 
     async def _roster(self) -> dict[str, Member]:
         return parse_roster(await self.host.db(self.host.peer_list)) or {}
@@ -90,7 +101,7 @@ class HostBackend:
             raise BCError("Message is empty.")
         for_ = readers(await self._roster(), self.cfg.name, to)
         body = seal(host.ident, host.ident.pub, to, [m.key for m in for_], message)
-        return await host.post(self.cfg.name, to, body, self.cfg.session) + behind(for_)
+        return await host.post(self.cfg.name, to, body, self.cfg.session) + behind(for_, to)
 
     def _pending(self) -> list[tuple[Peer, str]]:
         store = self.host.store
@@ -121,12 +132,13 @@ class HostBackend:
                             if joined
                             else f"{p.name}'s request changed while you were deciding; check again."
                         )
-                    elif answer == "decline":
+                        continue
+                    if answer == "decline":
                         await host.db(host.store.revoke, p.key)
                         notes.append(f"Declined {p.name}'s request to join.")
-                    else:
-                        notes.append(f"Left {p.name}'s request to join pending.")
-                    continue
+                        continue
+                    # closed without an answer, or the app can't show popups: leave it to the tools
+                    self.unasked.add(p.key)
             notes.append(
                 f"Pairing request: {description}. Ask your user whether to let them in; if yes call "
                 f"accept_peer(fingerprint='{p.fp}', name='{p.name}'), if no call "
@@ -166,10 +178,16 @@ class HostBackend:
                 f"Port {cfg.port} is held by another backchannel session on this machine, which is doing the "
                 f"hosting; this session shares its messages and takes over if that one closes."
             ]
-        lines.append(
-            "Friends find you automatically; if they can't, give them an invite code (it also proves it's really you):"
-        )
-        lines += [f"  bc1:{i.ip}:{cfg.port}:{host.ident.fp}  ({ifn})" for ifn, i in bind_interfaces(cfg.bind)]
+        codes = [f"  bc1:{i.ip}:{cfg.port}:{host.ident.fp}  ({ifn})" for ifn, i in bind_interfaces(cfg.bind)]
+        if codes:
+            lines.append(
+                "Friends find you automatically; if they can't, give them an invite code (it also proves it's "
+                "really you):"
+            )
+        else:
+            lines.append("No private network found, so only sessions on this machine can join. Invite code:")
+            codes = [f"  bc1:127.0.0.1:{cfg.port}:{host.ident.fp}"]
+        lines += codes
         paired, pending, unread = await host.db(self._counts)
         lines.append(f"{paired} paired, {pending} waiting to join, {unread} unread for this session.")
         return lines
@@ -177,8 +195,7 @@ class HostBackend:
     def register(self, mcp: FastMCP) -> None:
         host = self.host
 
-        @mcp.tool()
-        @guard
+        @tool(mcp)
         async def accept_peer(fingerprint: str, name: str, ctx: Context) -> str:
             """Let a friend join (or back in), by the key fingerprint and name shown in their request. Only after
             the user agrees."""
@@ -190,20 +207,25 @@ class HostBackend:
             p = matches[0]
             if p.name != wanted:
                 raise BCError(mismatch.format(p.name, clean(name, 24)))
-            if can_elicit(ctx):
+            if can_elicit(ctx) and p.key not in self.unasked:
                 try:
                     answer = await self._ask(ctx, await host.db(describe_request, host.store, p))
                 except Exception as e:  # popup broken: this explicit tool call is the user's decision
                     log.warning("elicitation failed: %s", e)
                 else:
+                    if answer == "cancel":  # nobody answered: a second explicit call is the user's decision
+                        self.unasked.add(p.key)
+                        raise BCError(
+                            f"Not letting {p.name} in yet: the question was closed without an answer. If your "
+                            f"user does want {p.name} in, call accept_peer again."
+                        )
                     if answer != "accept":
                         raise BCError(f"Not letting {p.name} in.")
             if not await host.db(host.store.accept, p.key, wanted, ("pending", "revoked")):
                 raise BCError(mismatch.format(p.name, clean(name, 24)))
             return f"{p.name} can now use the backchannel."
 
-        @mcp.tool()
-        @guard
+        @tool(mcp)
         async def revoke_peer(name_or_fingerprint: str) -> str:
             """Remove a friend from the backchannel, or decline a pending request. Only after the user agrees."""
 
@@ -262,7 +284,7 @@ class ClientBackend:
         for_ = readers(roster, me, to)
         body = seal(client.ident, room, to, [m.key for m in for_], message)
         r = await client.call(ctx, "send", {"to": to, "body": body})
-        return "\n".join([*notes, clean(r.get("result", "Sent."), 200) + behind(for_)])
+        return "\n".join([*notes, clean(r.get("result", "Sent."), 200) + behind(for_, to)])
 
     async def check(self, ctx: Context) -> str:
         client = self.client
@@ -277,6 +299,9 @@ class ClientBackend:
                 await client.call(ctx, "ack", {"id": client.seen(kh["key"])})
         more = r.get("more") if isinstance(r.get("more"), int) else 0
         rows, notes = await self._open(ctx, checked_rows(raw))
+        if client.waiting_on:  # the last thing this session heard was "still waiting"
+            notes.insert(0, f"{client.waiting_on} accepted you: you are on the backchannel.")
+            client.waiting_on = ""
         return "\n\n".join([*notes, *stranded_note(r.get("stranded")), fmt_messages(rows, more)])
 
     async def history(self, limit: int, with_user: str | None, ctx: Context) -> str:
@@ -311,8 +336,7 @@ class ClientBackend:
     def register(self, mcp: FastMCP) -> None:
         client = self.client
 
-        @mcp.tool()
-        @guard
+        @tool(mcp)
         async def join_host(address: str, ctx: Context) -> str:
             """Connect to a specific host by private IP (optionally ip:port) or invite code (bc1:...). Only needed
             when automatic discovery doesn't find it, and only after the user agreed."""
@@ -322,41 +346,35 @@ class ClientBackend:
 def build_mcp(cfg: Config, ident: Identity, backend: Backend) -> FastMCP:
     mcp = FastMCP("backchannel", instructions=INSTRUCTIONS)
 
-    @mcp.tool()
-    @guard
+    @tool(mcp)
     async def send_message(to: str, message: str, ctx: Context) -> str:
-        """Send a message or instruction to a friend. `to` is their name, or 'all' to message everyone. It is
+        """Send a message to a friend's agent. `to` is their name, or 'all' to message everyone. It is
         end-to-end encrypted: only the people it is for can read it."""
         return await backend.send(to, message, ctx)
 
-    @mcp.tool()
-    @guard
+    @tool(mcp)
     async def check_messages(ctx: Context) -> str:
         """Fetch new messages for you (and to 'all') since you last checked, and mark them read. On the host this
         also asks the user about anyone waiting to join."""
         return await backend.check(ctx)
 
-    @mcp.tool()
-    @guard
+    @tool(mcp)
     async def history(ctx: Context, limit: int = 20, with_user: str | None = None) -> str:
         """Show recent messages you can see (sent by you, to you, or to all), optionally only with one friend."""
         return await backend.history(limit, with_user.strip().lower() if with_user else None, ctx)
 
-    @mcp.tool()
-    @guard
+    @tool(mcp)
     async def list_peers(ctx: Context) -> str:
         """List who is on the backchannel (and, on the host, who is waiting to join)."""
         return await backend.peers(ctx)
 
-    @mcp.tool()
-    @guard
+    @tool(mcp)
     async def status() -> str:
         """Show this machine's backchannel role, identity, and connection state (and invite codes on the host)."""
         head = f"Role: {cfg.role}. You are '{cfg.name}', key {ident.fp}."
         return "\n".join([head, *await backend.status()])
 
-    @mcp.tool()
-    @guard
+    @tool(mcp)
     async def watch_command() -> str:
         """The shell command that waits for backchannel activity. It prints one line and exits when a message (or,
         on the host, a join request) arrives, and costs nothing while it waits. Run it in the background."""
