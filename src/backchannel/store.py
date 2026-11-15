@@ -455,9 +455,10 @@ class Store:
             where, args = where + " AND ts<=?", [*args, until]
         return self._rows(where + " ORDER BY id LIMIT ?", (*args, limit))
 
-    def conv_unread(self, user: str, sid: str, skip: tuple[str, ...] = ()) -> dict:
-        """Conversation messages not yet handed to this session, so a watcher can wake it."""
-        count, who = 0, set()
+    def conv_unread(self, user: str, sid: str, skip: tuple[str, ...] = (), after: int = 0) -> dict:
+        """Conversation messages not yet handed to this session (and newer than `after`), so a watcher can wake
+        it."""
+        count, who, latest = 0, set(), 0
         mine = self.db.execute(
             "SELECT m.conv, m.seen FROM conv_members m JOIN conversations c ON c.id=m.conv "
             "WHERE m.user=? AND m.state='joined' AND m.sid=? AND c.expires>?",
@@ -466,13 +467,13 @@ class Store:
         for conv, seen in mine:
             if conv in skip:
                 continue
-            for (sender,) in self.db.execute(
-                "SELECT sender FROM messages WHERE recipient=? AND id>? AND sender!=? LIMIT 200",
-                (f"#{conv}", seen, user),
+            for sender, mid in self.db.execute(
+                "SELECT sender, id FROM messages WHERE recipient=? AND id>? AND sender!=? ORDER BY id LIMIT 200",
+                (f"#{conv}", max(seen, after), user),
             ):
-                count += 1
+                count, latest = count + 1, max(latest, mid)
                 who.add(sender)
-        return {"count": count, "from": sorted(n for n in who if valid_name(n))[:10]}
+        return {"count": count, "from": sorted(n for n in who if valid_name(n))[:10], "latest": latest}
 
     def convs_for(self, user: str) -> list[dict]:
         """Conversations `user` is invited to or taking part in that are still going."""

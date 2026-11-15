@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "backchannel": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--project",
+        "${PLUGIN_ROOT}",
+        "--no-config",
+        "--locked",
+        "--no-dev",
+        "backchannel"
+      ],
+      "timeoutSeconds": 660
+    }
+  }
+}

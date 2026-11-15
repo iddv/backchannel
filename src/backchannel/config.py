@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import getpass
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -60,6 +61,17 @@ def _env(name: str, default: str = "") -> str:
     return default if not v or v.startswith("${") else v
 
 
+def _settings() -> dict:
+    """Settings from ~/.config/backchannel/config.json, for apps whose plugins can't ask the user for any
+    (role, name, port, bind). The environment wins over the file."""
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    with contextlib.suppress(OSError, ValueError):
+        d = json.loads((base / "backchannel" / "config.json").read_text())
+        if isinstance(d, dict):
+            return {k: str(v) for k, v in d.items() if isinstance(v, (str, int))}
+    return {}
+
+
 def valid_name(n: object) -> bool:
     return isinstance(n, str) and bool(NAME_RE.fullmatch(n)) and n != "all" and not FP_LIKE_RE.fullmatch(n)
 
@@ -90,22 +102,24 @@ class Config:
     bind: str  # overlay | private | comma-separated IPs
     data: Path
     session: str  # one id per Claude Code session (each runs its own copy of the server); the watcher inherits it
+    wake: bool = True  # may the app's hooks wake this session, or keep it going, when something arrives?
 
     @classmethod
     def from_env(cls) -> Config:
-        sid = _env("BACKCHANNEL_SESSION")
+        sid, saved = _env("BACKCHANNEL_SESSION"), _settings()
         try:
-            port = int(_env("BACKCHANNEL_PORT", "8787"))
+            port = int(_env("BACKCHANNEL_PORT", saved.get("port", "8787")))
         except ValueError:
             raise SystemExit("BACKCHANNEL_PORT must be a number") from None
         home = str(Path.home() / ".local/share/backchannel")
         return cls(
-            role=_env("BACKCHANNEL_ROLE", "client").lower(),
-            name=_norm_name(_env("BACKCHANNEL_NAME", getpass.getuser())),
+            role=_env("BACKCHANNEL_ROLE", saved.get("role", "client")).lower(),
+            name=_norm_name(_env("BACKCHANNEL_NAME", saved.get("name") or getpass.getuser())),
             port=port,
-            bind=_env("BACKCHANNEL_BIND", "overlay"),
+            bind=_env("BACKCHANNEL_BIND", saved.get("bind", "overlay")),
             data=Path(_env("BACKCHANNEL_DATA", _env("CLAUDE_PLUGIN_DATA", home))),
             session=sid if SID_RE.fullmatch(sid) else secrets.token_hex(6),
+            wake=_env("BACKCHANNEL_WAKE", saved.get("wake", "on")).lower() not in ("off", "no", "false", "0"),
         )
 
 

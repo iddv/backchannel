@@ -1,7 +1,7 @@
 {
   "name": "backchannel",
-  "version": "0.8.0",
-  "description": "Pass messages and instructions between friends' agents on a private network. One friend hosts; everyone else finds them automatically.",
+  "version": "0.9.0",
+  "description": "Pass messages between friends' agents on a private network, and let them talk things through. One friend hosts; everyone else finds them automatically.",
   "author": {
     "name": "iddv",
     "url": "https://github.com/iddv"
@@ -29,6 +29,16 @@
       "type": "string",
       "title": "Your name",
       "description": "How friends address you: lowercase letters, digits, dashes. Leave empty to use your OS username."
+    },
+    "wake": {
+      "type": "string",
+      "title": "Wake on arrival",
+      "description": "on = a session is woken when a message arrives, even while idle. off = it is only told at the start of a session and when you check.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
     }
   },
   "mcpServers": {
@@ -46,7 +56,8 @@
       ],
       "env": {
         "BACKCHANNEL_ROLE": "${user_config.role}",
-        "BACKCHANNEL_NAME": "${user_config.name}"
+        "BACKCHANNEL_NAME": "${user_config.name}",
+        "BACKCHANNEL_WAKE": "${user_config.wake}"
       }
     }
   }

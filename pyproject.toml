@@ -1,6 +1,6 @@
 [project]
 name = "backchannel"
-version = "0.8.0"
+version = "0.9.0"
 description = "Pass a note to your friend's coding agent: a private-network message relay for Claude Code, as an MCP server."
 readme = "README.md"
 license = "MIT"

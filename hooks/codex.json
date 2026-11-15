@@ -1,0 +1,27 @@
+{
+  "description": "Tells a Codex session what is waiting on the backchannel when it starts and when it stops; the backchannel server then wakes the session itself when something arrives.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --project \"${CLAUDE_PLUGIN_ROOT}\" --no-config --locked --no-dev backchannel hook session-start codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --project \"${CLAUDE_PLUGIN_ROOT}\" --no-config --locked --no-dev backchannel hook stop codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

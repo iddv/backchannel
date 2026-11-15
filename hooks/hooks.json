@@ -1,0 +1,34 @@
+{
+  "description": "Tells a session what is waiting on the backchannel when it starts, and wakes it when something arrives, so nothing has to be watched by hand.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --project \"${CLAUDE_PLUGIN_ROOT}\" --no-config --locked --no-dev backchannel hook session-start claude",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "uv run --quiet --project \"${CLAUDE_PLUGIN_ROOT}\" --no-config --locked --no-dev backchannel hook wake claude",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --quiet --project \"${CLAUDE_PLUGIN_ROOT}\" --no-config --locked --no-dev backchannel hook wake claude",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ]
+  }
+}

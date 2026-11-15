@@ -4,7 +4,9 @@ argument-hint: "[fallback interval, default 3m]"
 ---
 Start watching the backchannel for this session without polling.
 
-1. Call the backchannel `watch_command` tool. It returns one shell command. Run that command exactly as returned
+1. Call the backchannel `watch_command` tool. If it says this session is already woken automatically, tell the
+   user exactly that (there is nothing to start, and messages are still only shown, never acted on) and stop
+   here. Otherwise it returns one shell command. Run that command exactly as returned
    with the Bash tool, with `run_in_background: true`. It waits silently (no tokens are used while it waits) and
    exits when something arrives.
 2. Tell the user in one line that you're watching, that `/backchannel:stop` turns it off, and that messages are

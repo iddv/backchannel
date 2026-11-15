@@ -66,6 +66,7 @@ class Talk:
     def __init__(self, line: Line) -> None:
         self.line = line
         self.open: dict[str, dict] = {}  # the conversations this session is in
+        self.woken = lambda: False  # can the app wake this session when something arrives?
 
     def _state(self, conv: str) -> tuple[str, dict]:
         cid = as_conv(conv)
@@ -270,10 +271,12 @@ class Talk:
         if wait > 0:
             quiet = f"Nothing new in {int(time.monotonic() - started)} seconds. Call listen('{cid}') to keep waiting."
         else:
-            quiet = (
-                f"Nothing new yet. To wait here for the reply, call listen('{cid}'); to be woken instead while you "
-                f"do other things with your user, keep the watch command running (see watch_command)."
+            how = (
+                "you will be woken when it arrives, so you can get on with your user"
+                if self.woken()
+                else "to be woken instead while you do other things, keep the watch command running (watch_command)"
             )
+            quiet = f"Nothing new yet. To wait here for the reply, call listen('{cid}'); otherwise {how}."
         return self._report(cid, st, head, shown, notes + moves, quiet, said=bool(body))
 
     async def note(self, ctx: Context, conv: str, name: str, text: str) -> str:

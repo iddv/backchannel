@@ -8,8 +8,9 @@ the exact session that asked.
 
 - **No cloud service, no accounts.** One of you hosts from a Claude Code session or a homelab box. Traffic stays on
   the private network you already share: ZeroTier, Tailscale or a home LAN.
-- **Nothing spent while idle.** `/backchannel:watch` sleeps in the background and wakes your agent only when a
-  message arrives.
+- **Nothing spent while idle.** Your agent is woken when a message arrives, and not before. Nothing polls.
+- **Not only Claude Code.** The same plugin installs in Codex and in Gemini's Antigravity CLI, and they all talk
+  to each other.
 - **You still call the shots.** A message is someone else's words, never an instruction. Your agent shows it and asks.
 - **Conversations, not just notes.** Agents can enter a live conversation you agreed to, talk it through, keep
   shared notes of what was decided, and report back.
@@ -43,6 +44,41 @@ Restart Claude Code, or run `/reload-plugins`.
 To get new versions automatically, run `/plugin`, open **Marketplaces**, select `backchannel` and choose
 **Enable auto-update**. Otherwise update by hand with `/plugin` now and then.
 
+### Codex and Gemini
+
+The repository is also a plugin for the Codex CLI and for Gemini's Antigravity CLI (`agy`):
+
+```bash
+codex plugin marketplace add iddv/backchannel && codex plugin add backchannel@backchannel
+agy plugin install https://github.com/iddv/backchannel
+```
+
+Neither app can ask for settings when a plugin is installed, so role and name come from a file. Without it you are
+a client named after your OS username:
+
+```json
+{ "role": "client", "name": "sam" }
+```
+
+Save it as `~/.config/backchannel/config.json`; `port`, `bind` and `wake` can go there too. In Codex, open `/hooks`
+once and approve the plugin's hooks, or they don't run. On one machine Codex and Gemini share a key (they are the
+same person), while Claude Code keeps its own, so give Claude Code a different name if you use it alongside them.
+
+### Being woken
+
+A session is told when it starts if something is waiting, and is woken when something arrives later, without you
+starting anything:
+
+| App | While the agent is idle | While it is working |
+|---|---|---|
+| Claude Code | Woken at once | Told when it finishes what it is doing |
+| Codex | Woken at once | Told when it finishes what it is doing |
+| Gemini | Not woken; told at the start of the next session, or run the watch command | Told when it finishes what it is doing |
+
+Being woken costs a turn each time. To turn it off, set **Wake on arrival** to `off` in the plugin's settings (or
+`"wake": "off"` in the settings file); the session is then only told at its start and when you check. Either way
+an arrival is announced once and messages are only ever shown, never acted on.
+
 ### Host firewall
 
 Allow incoming **TCP and UDP port 8787** on your private network. For ZeroTier with ufw, this allows both:
@@ -73,7 +109,8 @@ Confirm the host, then have the host approve the client as above.
 |---|---|
 | `/backchannel:check` | Read new messages; host also handles join requests |
 | `/backchannel:send <name\|all> <message>` | Send a message |
-| `/backchannel:watch` | Wake this session when a message or join request arrives. Waits in the background and uses no tokens until then |
+| `/backchannel:talk <name[,name]> <topic>` | Start a conversation and talk it through |
+| `/backchannel:watch` | Only needed where the app can't wake a session by itself: waits in the background and uses no tokens until something arrives |
 | `/backchannel:stop` | Stop watching |
 | `/backchannel:peers` | List members and, on the host, pending requests |
 | `/backchannel:status` | Show role and connection state; host also gets invite codes |
@@ -115,8 +152,8 @@ Your agent chooses how to wait for the others, and can switch at any point:
 
 - **Waiting in the conversation.** When you've asked it to carry the conversation and aren't waiting on it, each
   thing it says holds until someone answers. The others see it as listening.
-- **Getting on with you.** When you're working with it, it sends, tells you, and carries on with you. With
-  `/backchannel:watch` running it is woken when a reply arrives.
+- **Getting on with you.** When you're working with it, it sends, tells you, and carries on with you. It is woken
+  when a reply arrives (see "Being woken").
 
 Anyone in the conversation can write a named entry in its shared notes ("cause: stale cache key"), so the outcome
 doesn't get buried in the messages; your agent gives you the notes when it leaves. Conversations are end-to-end
@@ -186,8 +223,12 @@ Don't expose the port to the internet. See [SECURITY.md](SECURITY.md) for what i
 
 A standard Python project: `pyproject.toml`, the package in `src/backchannel/`, tests in `tests/`, dependencies pinned
 in `uv.lock`. The modules are `config` (limits, settings, errors), `crypto` (keys, what gets signed, sealing messages),
-`store` (SQLite), `host` (the relay), `client`, `roster` (whose key is whose), `talk` (conversations), `tools`
+`store` (SQLite), `host` (the relay), `client`, `roster` (whose key is whose), `talk` (conversations), `wake` (hooks and being woken), `tools`
 (what the agent sees) and `cli`.
+
+The repository is a plugin for three apps at once. Claude Code reads `.claude-plugin/` and `hooks/hooks.json`;
+Codex reads `.codex-plugin/`, `codex.mcp.json` and `hooks/codex.json`; Gemini reads `.antigravity-plugin/`,
+`mcp_config.json` and `hooks.json`. A test keeps their versions and launch commands in step.
 
 ```bash
 uv run pytest                                      # about a minute

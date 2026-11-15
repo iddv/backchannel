@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import shlex
 import sys
+from pathlib import Path
 from typing import Protocol
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -394,8 +396,16 @@ class ClientBackend:
             return await client.join(address, ctx)
 
 
-def build_mcp(cfg: Config, ident: Identity, backend: Backend) -> FastMCP:
+def build_mcp(cfg: Config, ident: Identity, backend: Backend, entry: Path | None = None) -> FastMCP:
+    """`entry` is this session's note in the wake-up registry: a hook writes there once it can wake the session."""
     mcp = FastMCP("backchannel", instructions=INSTRUCTIONS)
+
+    def woken() -> bool:
+        with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+            return json.loads(entry.read_text()).get("wakes") in ("claude", "codex")
+        return False
+
+    backend.talk.woken = woken
 
     @tool(mcp)
     async def send_message(to: str, message: str, ctx: Context) -> str:
@@ -428,7 +438,10 @@ def build_mcp(cfg: Config, ident: Identity, backend: Backend) -> FastMCP:
     @tool(mcp)
     async def watch_command() -> str:
         """The shell command that waits for backchannel activity. It prints one line and exits when a message (or,
-        on the host, a join request) arrives, and costs nothing while it waits. Run it in the background."""
+        on the host, a join request) arrives, and costs nothing while it waits. Run it in the background. Not
+        needed where the app wakes this session by itself, which the result then says."""
+        if woken():
+            return "Nothing to run: this session is already woken automatically when something arrives."
         env = {
             "BACKCHANNEL_ROLE": cfg.role,
             "BACKCHANNEL_NAME": cfg.name,

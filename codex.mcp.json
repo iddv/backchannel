@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "backchannel": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--project",
+        ".",
+        "--no-config",
+        "--locked",
+        "--no-dev",
+        "backchannel"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "BACKCHANNEL_ROLE",
+        "BACKCHANNEL_NAME",
+        "BACKCHANNEL_PORT",
+        "BACKCHANNEL_BIND",
+        "BACKCHANNEL_DATA",
+        "BACKCHANNEL_WAKE"
+      ],
+      "tool_timeout_sec": 660
+    }
+  }
+}

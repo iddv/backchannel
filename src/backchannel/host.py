@@ -525,9 +525,12 @@ class Host:
             self.store.touch(peer.name, sid)
         out = self.store.waiting(peer.name, after, sid)
         # conversation messages this session isn't already listening for wake it too
-        conv = self.store.conv_unread(peer.name, sid, tuple(c for c, u in list(self.listening) if u == peer.name))
+        listening = tuple(c for c, u in list(self.listening) if u == peer.name)
+        newer = after if isinstance(after, int) and not isinstance(after, bool) else 0
+        conv = self.store.conv_unread(peer.name, sid, listening, newer)
         out["unread"] += conv["count"]
         out["from"] = sorted({*out["from"], *conv["from"]})[:10]
+        out["latest"] = max(out["latest"], conv["latest"])
         return 200, out
 
     async def _wait(self, req: Request, nonce: str, key: str, data: dict, sid: str) -> Response:

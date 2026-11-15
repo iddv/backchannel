@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import os
 import sys
-import time
+from pathlib import Path
 
 import httpx
 import psutil
@@ -15,22 +14,18 @@ import psutil
 from .client import Client
 from .config import (
     HEARTBEAT,
-    PENDING_TTL,
-    WAIT_HOLD,
     BCError,
     Config,
-    StaleHost,
     log,
     prepare_data_dir,
     setup_logging,
-    valid_name,
-    write_private,
 )
 from .crypto import Identity
 from .host import Host
 from .net import bind_interfaces
 from .store import Store
 from .tools import ClientBackend, HostBackend, build_mcp
+from .wake import activity, codex_waker, hook, register
 
 USAGE = """\
 backchannel: pass messages and instructions between friends' AI agents on a private network.
@@ -46,6 +41,7 @@ members, so the host relays and stores only ciphertext. MCP itself never goes ov
     backchannel peers [accept <fingerprint> <name> | revoke <name|fingerprint>]
     backchannel status
     backchannel wait      block until something new arrives, print one line, exit
+    backchannel hook <session-start|stop|wake> <claude|codex|gemini>   for the agent app's hooks
 """
 
 
@@ -72,9 +68,18 @@ async def heartbeat(cfg: Config, host: Host | None, client: Client | None) -> No
 
 async def run_stdio(cfg: Config, ident: Identity) -> None:
     """The MCP server Claude Code talks to, plus what runs beside it: the heartbeat and, for a host, the relay."""
+    entry = register(cfg)  # so the app's hooks can find this session
+    try:
+        await _run_stdio(cfg, ident, entry)
+    finally:
+        with contextlib.suppress(OSError):
+            entry.unlink()
+
+
+async def _run_stdio(cfg: Config, ident: Identity, entry: Path) -> None:
     if cfg.role == "host":
         host = make_host(cfg, ident)
-        mcp = build_mcp(cfg, ident, HostBackend(cfg, host))
+        mcp = build_mcp(cfg, ident, HostBackend(cfg, host), entry)
 
         async def relay() -> None:
             try:
@@ -84,6 +89,7 @@ async def run_stdio(cfg: Config, ident: Identity) -> None:
 
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(relay()), tg.create_task(heartbeat(cfg, host, None))]
+            tasks.append(tg.create_task(codex_waker(cfg, ident, entry)))
             await mcp.run_stdio_async()
             for task in tasks:
                 task.cancel()
@@ -93,9 +99,10 @@ async def run_stdio(cfg: Config, ident: Identity) -> None:
     client = Client(ident, cfg.name, cfg.data, cfg.port, cfg.session)
     try:
         async with asyncio.TaskGroup() as tg:
-            task = tg.create_task(heartbeat(cfg, None, client))
-            await build_mcp(cfg, ident, ClientBackend(cfg, client)).run_stdio_async()
-            task.cancel()
+            tasks = [tg.create_task(heartbeat(cfg, None, client)), tg.create_task(codex_waker(cfg, ident, entry))]
+            await build_mcp(cfg, ident, ClientBackend(cfg, client), entry).run_stdio_async()
+            for task in tasks:
+                task.cancel()
     finally:
         await client.aclose()
 
@@ -112,91 +119,13 @@ def _launcher() -> tuple[int, int]:
     return parent, 0
 
 
-def _say(line: str) -> None:
-    """The one line the agent reads when the watcher fires."""
-    print(f"backchannel: {line}", flush=True)
-
-
-async def wait_host(cfg: Config) -> int:
-    """Host side of `wait`: watch the local store for unread messages and new join requests."""
-    store = Store(cfg.data / "backchannel.db")
-    told_file = cfg.data / "announced.json"  # each join request wakes a watcher once, however long it stays pending
-
-    def fresh_requests() -> list[str]:
-        told: list = []
-        with contextlib.suppress(OSError, ValueError):
-            told = json.loads(told_file.read_text())
-        told = told if isinstance(told, list) else []
-        now = [f"{p.key}:{p.updated}" for p in store.peers("pending") if time.time() - p.updated < PENDING_TTL]
-        new = [t for t in now if t not in told]
-        if new:
-            with contextlib.suppress(OSError):
-                write_private(told_file, json.dumps(now))
-        return new
-
-    def poll(touch: bool) -> tuple[dict, list[str]]:
-        if touch:
-            store.touch(cfg.name, cfg.session)
-        waiting, conv = store.waiting(cfg.name, sid=cfg.session), store.conv_unread(cfg.name, cfg.session)
-        waiting["unread"] += conv["count"]
-        waiting["from"] = sorted({*waiting["from"], *conv["from"]})
-        return waiting, fresh_requests()
-
-    parent, touched = _launcher(), float("-inf")
-    while _launcher() == parent:
-        touch = time.monotonic() - touched >= 20
-        if touch:
-            touched = time.monotonic()
-        waiting, fresh = await asyncio.to_thread(poll, touch)
-        if waiting["unread"] or fresh:
-            bits = []
-            if waiting["unread"]:
-                bits.append(f"{waiting['unread']} new message(s) from {', '.join(waiting['from'])}")
-            if fresh:
-                bits.append(f"{len(fresh)} request(s) to join")
-            _say(f"{' and '.join(bits)}. Run /backchannel:check.")
-            return 0
-        await asyncio.sleep(2)
-    return 0
-
-
-async def wait_client(cfg: Config, ident: Identity) -> int:
-    """Client side of `wait`: long-poll the pinned host. Never looks for a host by sweeping addresses."""
-    client = Client(ident, cfg.name, cfg.data, cfg.port, cfg.session)
-    try:
-        if not client.known():
-            _say("not connected to a host yet, so there is nothing to watch. Run /backchannel:check first.")
-            return 2
-        parent, delay, host = _launcher(), 5, None
-        while _launcher() == parent:
-            try:
-                host = host or await client.ensure_host(sweep=False)
-                r = await client.post(
-                    host, "wait", {"after": client.seen(host["key"]), "timeout": WAIT_HOLD}, timeout=WAIT_HOLD + 15
-                )
-            except StaleHost:
-                host = None
-                continue
-            except BCError as e:
-                host = None
-                if e.code == "unknown_op":
-                    _say("this host runs an older backchannel without push. Fall back to checking on an interval.")
-                    return 3
-                if e.code in ("declined", "host_key_changed"):
-                    _say(str(e))
-                    return 2
-                # offline, not accepted yet, rate limited, too many watchers: quietly try again later
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 120)
-                continue
-            delay = 5
-            if isinstance(r.get("unread"), int) and r["unread"] > 0:
-                who = [n for n in r.get("from") or [] if valid_name(n)] if isinstance(r.get("from"), list) else []
-                _say(f"{r['unread']} new message(s){' from ' + ', '.join(who) if who else ''}. Run /backchannel:check.")
-                return 0
-        return 0
-    finally:
-        await client.aclose()
+async def wait(cfg: Config, ident: Identity) -> int:
+    """`backchannel wait`: block until something arrives for this session, print one line, exit."""
+    parent = _launcher()
+    code, text, _ = await activity(cfg, ident, lambda: _launcher() == parent)
+    if text:
+        print(f"backchannel: {text}{'. Run /backchannel:check.' if code == 0 else ''}", flush=True)
+    return 0 if code == 1 else code
 
 
 # ---------------------------------------------------------------- pairing commands for a headless host
@@ -232,6 +161,12 @@ def peers_command(cfg: Config, args: list[str]) -> None:
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     setup_logging()
+    if argv[:1] == ["hook"]:  # run by the agent's app, not by a person: it finds its own session's settings
+        try:
+            sys.exit(asyncio.run(hook(argv[1] if len(argv) > 1 else "", argv[2] if len(argv) > 2 else "claude")))
+        except Exception as e:
+            log.debug("hook failed: %s", e)
+            sys.exit(0)
     cfg = Config.from_env()
     prepare_data_dir(cfg.data)
     ident = Identity(cfg.data / "identity.json")
@@ -241,7 +176,7 @@ def main(argv: list[str] | None = None) -> None:
     elif command == "serve":
         asyncio.run(make_host(cfg, ident, relay=True).serve(install_signal_handlers=True))
     elif command == "wait":
-        sys.exit(asyncio.run(wait_host(cfg) if cfg.role == "host" else wait_client(cfg, ident)))
+        sys.exit(asyncio.run(wait(cfg, ident)))
     elif command == "status":
         print(f"name {cfg.name}, key {ident.fp}, data {cfg.data}")
         for ifn, i in bind_interfaces(cfg.bind):

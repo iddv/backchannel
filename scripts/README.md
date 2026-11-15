@@ -19,6 +19,19 @@ installed and signed in, and it adds a temporary MCP entry to the Gemini CLI's c
 
 Machine: a small homelab box (Linux), everything on loopback.
 
+### 0.9.0
+
+Hooks and waking were tried in real interactive sessions of each app, each as a client of a loopback host:
+
+| App | Told at session start what was waiting | A message while idle | A message while working |
+|---|---|---|---|
+| Claude Code 2.1.325 | yes | woken; finished a turn about it 13 s later | covered by the same hook |
+| Codex 0.169.0 | yes | woken; finished a turn showing it 3 s later | told by the stop hook |
+| Gemini (agy 1.5.1) | yes | not woken (its hooks can't) | told by the stop hook |
+
+The Gemini plugin was loaded from a workspace plugin folder; the Codex manifest was not installed for real (its
+server and hook commands were run exactly as written), so `codex plugin add` itself is untested.
+
 ### 0.8.0
 
 Pen test: 64 of 64 checks passed, 13 of them new attacks on conversations. The first run failed one: six

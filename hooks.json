@@ -1,0 +1,18 @@
+{
+  "backchannel": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "uv run --quiet --project . --no-config --locked --no-dev backchannel hook session-start gemini",
+        "timeout": 30
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "uv run --quiet --project . --no-config --locked --no-dev backchannel hook stop gemini",
+        "timeout": 30
+      }
+    ]
+  }
+}
