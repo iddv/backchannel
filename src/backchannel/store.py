@@ -12,6 +12,7 @@ from pathlib import Path
 from .config import (
     CHECK_MAX_BYTES,
     CHECK_MAX_MESSAGES,
+    MAX_BODY,
     PENDING_TTL,
     RETENTION_DAYS,
     RETENTION_MAX,
@@ -19,7 +20,7 @@ from .config import (
     log,
     valid_name,
 )
-from .crypto import canonical_key, fingerprint, norm_fp
+from .crypto import canonical_key, fingerprint, is_sealed, norm_fp
 
 
 @dataclass
@@ -31,6 +32,7 @@ class Peer:
     addr: str
     updated: float
     joined_id: int
+    e2e: int  # has used a backchannel that can end-to-end encrypt (0.7 or later)
 
 
 PEER_FIELDS = tuple(f.name for f in fields(Peer))
@@ -117,7 +119,11 @@ class Store:
         ex("CREATE TABLE IF NOT EXISTS sends (sender TEXT NOT NULL, ts REAL NOT NULL)")
         ex("CREATE INDEX IF NOT EXISTS sends_sender_ts ON sends(sender, ts)")
 
-    _MIGRATIONS = (_schema_1,)
+    def _schema_2(self) -> None:
+        """0.7: who has used a version that can read end-to-end encrypted messages."""
+        self.db.execute("ALTER TABLE peers ADD COLUMN e2e INTEGER NOT NULL DEFAULT 0")
+
+    _MIGRATIONS = (_schema_1, _schema_2)
 
     def lock_down(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -154,7 +160,7 @@ class Store:
 
     def request_pairing(self, key: str, name: str, addr: str) -> None:
         self.db.execute(
-            f"INSERT INTO peers({PEER_COLS}) VALUES(?,?,?,'pending',?,?,0) "
+            "INSERT INTO peers(key,name,fp,status,addr,updated,joined_id) VALUES(?,?,?,'pending',?,?,0) "
             "ON CONFLICT(key) DO UPDATE SET name=excluded.name, status='pending', addr=excluded.addr, "
             "updated=CASE WHEN peers.status='pending' THEN peers.updated ELSE excluded.updated END",
             (key, name, fingerprint(key), addr, time.time()),
@@ -230,6 +236,9 @@ class Store:
                 "DO UPDATE SET last_seen=excluded.last_seen",
                 (user, sid, time.time()),
             )
+
+    def set_e2e(self, key: str) -> None:
+        self.db.execute("UPDATE peers SET e2e=1 WHERE key=?", (key,))
 
     def live_sessions(self, user: str) -> list[str]:
         """Sessions that are still open: each one calls in every HEARTBEAT seconds."""
@@ -332,7 +341,8 @@ class Store:
         where, args = self._unread(user, sid)
         rows, size = [], 0
         for m in self._rows(where + " ORDER BY id LIMIT ?", (*args, CHECK_MAX_MESSAGES)):
-            size += len(m["body"].encode())
+            # the budget is about what the agent ends up reading; an encrypted body is its text in base64, plus keys
+            size += min(len(m["body"]) * 3 // 4, MAX_BODY) if is_sealed(m["body"]) else len(m["body"].encode())
             if rows and size > CHECK_MAX_BYTES:
                 break
             rows.append(m)

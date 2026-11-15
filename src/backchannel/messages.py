@@ -7,7 +7,7 @@ import secrets
 import unicodedata
 from datetime import datetime
 
-from .config import MAX_BODY, valid_name
+from .config import MAX_BODY, MAX_SEALED, SEALED_PREFIX, valid_name
 
 _DROP_CATEGORIES = {"Cc", "Cf", "Co", "Cn", "Cs", "Zl", "Zp"}
 _TAG_WORD = re.compile(r"message-[0-9a-f]{8}", re.I)
@@ -65,5 +65,6 @@ def checked_rows(rows: object) -> list[dict]:
             and valid_name(s)
             and (r == "all" or valid_name(r))
         ):
-            out.append({"id": m["id"], "ts": float(m["ts"]), "sender": s, "recipient": r, "body": m["body"][:MAX_BODY]})
+            cap = MAX_SEALED if m["body"].startswith(SEALED_PREFIX) else MAX_BODY
+            out.append({"id": m["id"], "ts": float(m["ts"]), "sender": s, "recipient": r, "body": m["body"][:cap]})
     return out

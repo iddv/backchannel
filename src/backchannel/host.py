@@ -28,6 +28,7 @@ from .config import (
     MAX_BODY,
     MAX_PENDING,
     MAX_REQUEST,
+    MAX_SEALED,
     NONCE_MAX,
     NONCE_TTL,
     PAIR_PER_MINUTE_PER_IP,
@@ -43,7 +44,16 @@ from .config import (
     log,
     valid_name,
 )
-from .crypto import Identity, canonical_key, fingerprint, hello_payload, request_payload, response_payload, verify
+from .crypto import (
+    Identity,
+    canonical_key,
+    fingerprint,
+    hello_payload,
+    is_sealed,
+    request_payload,
+    response_payload,
+    verify,
+)
 from .messages import clean
 from .net import Limiter, bind_interfaces
 from .store import Peer, Store
@@ -65,11 +75,23 @@ class NonceCache:
         return True
 
 
-class Host:
-    """Message store plus the network-facing relay. `name` is the host user's own name."""
+NEEDS_UPDATE = (
+    "This backchannel only carries end-to-end encrypted messages, which needs backchannel 0.7 or later. Update "
+    "the plugin (/plugin) and start a new session."
+)
+UNREADABLE = (
+    "[This message is end-to-end encrypted, and this session runs a backchannel from before 0.7 that can't "
+    "read it. Update the plugin and start a new session, then look in history.]"
+)
 
-    def __init__(self, ident: Identity, store: Store, name: str, port: int, bind: str = "overlay"):
+
+class Host:
+    """Message store plus the network-facing relay. `name` is the host user's own name. `relay` means nobody
+    reads messages here (a headless host), so nothing is encrypted for it."""
+
+    def __init__(self, ident: Identity, store: Store, name: str, port: int, bind: str = "overlay", relay: bool = False):
         self.ident, self.store, self.name, self.port, self.bind = ident, store, name, port, bind
+        self.relay = relay
         # every touch of the store happens on this one thread: the event loop never waits on the disk, and
         # requests stay serialised exactly as they were when they ran on the loop
         self._db = ThreadPoolExecutor(max_workers=1, thread_name_prefix="backchannel-db")
@@ -115,7 +137,7 @@ class Host:
             raise BCError(f"Unknown recipient '{clean(to, 30)}'. Known: all, {', '.join(sorted(self.known_names()))}.")
         if not body.strip():
             raise BCError("Message is empty.")
-        if len(body.encode()) > MAX_BODY:
+        if len(body.encode()) > (MAX_SEALED if is_sealed(body) else MAX_BODY):
             raise BCError(f"Message too long (max {MAX_BODY // 1024} KiB).")
         if not self.limiter.ok(f"send:{sender}", SEND_PER_MINUTE, 60):
             raise BCError(f"Rate limit: at most {SEND_PER_MINUTE} messages a minute.")
@@ -133,8 +155,14 @@ class Host:
         return f"Sent message #{msg_id} to {to}."
 
     def peer_list(self) -> list[dict]:
-        out = [{"name": self.name, "fp": self.ident.fp, "host": True}]
-        out += [{"name": p.name, "fp": p.fp, "host": False} for p in self.store.peers("accepted")]
+        """Everyone on the backchannel, with their keys. `e2e` says whether they have a version that can read
+        encrypted messages (0.7 or later); nobody reads messages on a headless relay."""
+        out = [
+            {"name": self.name, "fp": self.ident.fp, "host": True, "key": self.ident.pub, "e2e": not self.relay}
+            | ({"relay": True} if self.relay else {})
+        ]
+        for p in self.store.peers("accepted"):
+            out.append({"name": p.name, "fp": p.fp, "host": False, "key": p.key, "e2e": bool(p.e2e)})
         return out
 
     def inbox(self, user: str, sid: str, hold: bool = False, ack: object = None) -> dict:
@@ -288,6 +316,8 @@ class Host:
             if handler is None:
                 return 404, {"error": "unknown_op"}
             self.store.touch(peer.name, sid)
+            if data.get("e2e") is True and not peer.e2e:
+                self.store.set_e2e(key)
             return 200, handler(self, peer, data, sid)
         except BCError as e:
             return 422, {"error": str(e)}
@@ -295,11 +325,22 @@ class Host:
             return 400, {"error": "bad_request"}
 
     def _op_send(self, peer: Peer, data: dict, sid: str) -> dict:
-        return {"result": self.send(peer.name, str(data.get("to", "")), str(data.get("body", "")), sid)}
+        body = str(data.get("body", ""))
+        if not is_sealed(body):  # a client from before 0.7; nobody on 0.7 would show its message anyway
+            raise BCError(NEEDS_UPDATE)
+        return {"result": self.send(peer.name, str(data.get("to", "")), body, sid)}
+
+    @staticmethod
+    def _readable(data: dict, rows: list[dict]) -> list[dict]:
+        """What a client older than 0.7 gets in place of a message it can't decrypt."""
+        if data.get("e2e") is True:
+            return rows
+        return [{**m, "body": UNREADABLE} if is_sealed(m["body"]) else m for m in rows]
 
     def _op_check(self, peer: Peer, data: dict, sid: str) -> dict:
         # v0.3 clients send {} and are marked read at once; newer ones hold and acknowledge
-        return self.inbox(peer.name, sid, hold=data.get("hold") is True, ack=data.get("ack"))
+        box = self.inbox(peer.name, sid, hold=data.get("hold") is True, ack=data.get("ack"))
+        return {**box, "messages": self._readable(data, box["messages"])}
 
     def _op_ack(self, peer: Peer, data: dict, sid: str) -> dict:
         self.store.ack(peer.name, data.get("id"), sid)
@@ -310,7 +351,8 @@ class Host:
 
     def _op_history(self, peer: Peer, data: dict, sid: str) -> dict:
         w = data.get("with")
-        return {"messages": self.store.history(peer.name, int(data.get("limit", 20)), str(w).lower() if w else None)}
+        rows = self.store.history(peer.name, int(data.get("limit", 20)), str(w).lower() if w else None)
+        return {"messages": self._readable(data, rows)}
 
     def _op_peers(self, peer: Peer, data: dict, sid: str) -> dict:
         return {"peers": self.peer_list()}

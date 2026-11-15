@@ -48,7 +48,7 @@ def test_old_databases_are_revalidated_and_versioned(tmp_path):
     assert ("good", "accepted") in names
     assert not any(n.startswith("bad") for n, _ in names)
     assert sum(1 for n, s in names if n == "dup" and s == "accepted") == 1
-    assert st.db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert st.db.execute("PRAGMA user_version").fetchone()[0] == len(Store._MIGRATIONS)
     st.db.close()
     again = Store(path)  # opening an up-to-date database changes nothing
     assert {(p.name, p.status) for p in again.peers()} == names

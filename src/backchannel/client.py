@@ -332,7 +332,8 @@ class Client:
 
     async def post(self, host: dict, op: str, payload: dict, timeout: float = 10) -> dict:
         """One signed request to the host. Raises BCError (with the host's error code in `.code`) on any failure."""
-        body = json.dumps({**payload, "sid": self.sid} if self.sid else payload).encode()
+        # e2e: this client can read end-to-end encrypted messages (hosts older than 0.7 ignore it)
+        body = json.dumps({**payload, "e2e": True, **({"sid": self.sid} if self.sid else {})}).encode()
         path, ts, nonce = f"/api/{op}", str(int(time.time() * 1000)), secrets.token_urlsafe(16)
         sig = self.ident.sign(request_payload(host["key"], host["boot"], "POST", path, ts, nonce, body))
         headers = {

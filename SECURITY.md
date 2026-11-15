@@ -13,7 +13,8 @@ Don't open a public issue for security problems.
 backchannel is built for a small group of friends on a private overlay network (ZeroTier, Tailscale) or a home
 LAN. It assumes:
 
-- **The host is trusted.** It relays and stores every message and could read or forge any of them.
+- **The host is trusted to run the group, not with its contents.** It decides who is a member and hands out
+  everyone's keys. Since 0.7 it relays and stores messages it can't read or alter (see end-to-end encryption below).
 - **Accepted peers are mostly trusted, but may turn malicious or get compromised.** Their messages are treated as
   untrusted input.
 - **Other machines on the same network are not trusted.** That includes strangers on shared Wi-Fi and network
@@ -24,6 +25,9 @@ LAN. It assumes:
 
 | Threat | Defence |
 |---|---|
+| The host (or anyone who breaks into it) reading or changing messages | Messages are end-to-end encrypted and signed on the sender's machine: X25519 key agreement from each device's existing Ed25519 key, a fresh key per message, ChaCha20-Poly1305, and an Ed25519 signature by the sender. The sender, recipient, time and the backchannel it belongs to are bound into the encryption, so a message can't be re-attributed, redirected or moved to another group. One that fails any check is not shown |
+| The host swapping someone's key to sit in the middle | Each client remembers the key it first saw for every member and tells you when one changes. Key fingerprints are shown in the member list so you can compare them out of band |
+| The host switching encryption off, or slipping in messages of its own | There is no unencrypted mode. Every message is sent encrypted, and one that arrives unencrypted is never shown, whatever name is on it |
 | Impersonating a friend | Every request is signed with a per-device Ed25519 key. A name belongs to one key, and a new key using a known name is flagged `NEW KEY` and must be approved |
 | Replaying or forwarding requests | Signatures cover the host's key, a per-process boot id, timestamp, nonce, method, path and body hash. The host keeps a nonce cache |
 | Forging or altering host replies (man in the middle) | Every reply is signed by the host key the client pinned, bound to that exact request |
@@ -41,12 +45,20 @@ LAN. It assumes:
 
 ## What isn't
 
-- **Message confidentiality on a plain LAN.** Traffic is signed but not encrypted. ZeroTier and Tailscale encrypt
-  it between members, so prefer them over a plain LAN.
+- **Metadata.** The host, and anyone watching a plain LAN, sees who writes to whom, when, and roughly how much.
+  Member lists and requests are signed but not encrypted. ZeroTier and Tailscale hide all of it from outsiders.
+- **A lying host the first time you meet someone.** Your client learns each member's key from the host. A malicious
+  host could hand out a key of its own for a member you have never exchanged messages with, and read what you send
+  them. Comparing fingerprints with your friend rules it out; a later swap is always reported.
+- **Dropped, delayed, reordered or repeated messages.** The host delivers, so it can also not deliver, or deliver
+  twice. A repeated message still shows the time its sender signed.
+- **Forward secrecy.** Keys are long-lived. Someone who records the ciphertext and later steals a device's
+  `identity.json` can read that device's past messages.
 - **A determined prompt injection.** Passing instructions between agents is the point of backchannel, so the defence is
   making sure your agent knows exactly who wrote what and checks with you, not blocking actions. Your agent is still a
   language model. Keep Claude Code's permission prompts on, and don't use
   `--dangerously-skip-permissions` while watching the backchannel.
-- **A compromised host.** It can read and forge everything.
+- **A compromised host, beyond the above.** It can't read or forge encrypted messages, but it can let new members
+  in, remove people, withhold messages and see the metadata.
 - **Updates.** Installing or updating the plugin runs code from this repository. Review releases before updating if
   that matters to you, and pin a version.

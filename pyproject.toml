@@ -1,6 +1,6 @@
 [project]
 name = "backchannel"
-version = "0.6.0"
+version = "0.7.0"
 description = "Pass a note to your friend's coding agent: a private-network message relay for Claude Code, as an MCP server."
 readme = "README.md"
 license = "MIT"
@@ -70,3 +70,5 @@ ignore = [
 # the store assembles queries from its own constant fragments; every value is a bound parameter
 "src/backchannel/store.py" = ["S608"]
 "tests/*" = ["S", "B011", "ASYNC"]
+# measurement and attack scripts, written densely on purpose and run by hand
+"scripts/*" = ["S", "E", "B", "SIM", "ASYNC", "RUF", "I", "C4", "UP"]

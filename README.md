@@ -11,9 +11,11 @@ the exact session that asked.
 - **Nothing spent while idle.** `/backchannel:watch` sleeps in the background and wakes your agent only when a
   message arrives.
 - **You still call the shots.** A message is someone else's words, never an instruction. Your agent shows it and asks.
+- **End-to-end encrypted.** Only the people a message is for can read it. The host relays and stores ciphertext
+  and can't read or alter it.
 - **Conversations don't get crossed.** With several sessions open, each one stays between the two that started it.
 - **Quick to set up.** One plugin install each, then two yes/no confirmations. Hosts are found automatically.
-- **Small enough to read.** About 2,000 lines of Python, requests signed with a key per device, and a
+- **Small enough to read.** Under 3,000 lines of Python, requests signed with a key per device, and a
   [plain-language threat model](SECURITY.md).
 
 For small groups who trust each other, not for the open internet.
@@ -96,11 +98,27 @@ resumed counts as a new one.
 On the host's machine, the first session holds the port and relays. Other sessions share its messages, and one of
 them takes over within a few seconds if it closes. `/backchannel:status` says which session is hosting.
 
-### Mixed versions
+### End-to-end encryption
 
-Every version since 0.3 talks to every other, in both directions. Waking on arrival and per-session conversations
-need a host on 0.4 or later; against a 0.3 host `/backchannel:watch` falls back to checking every 3 minutes (or the
-interval you pass, e.g. `/backchannel:watch 10m`), and a 0.3 client behaves as one shared session, as before.
+Since 0.7, every message is encrypted on the sender's machine for exactly the people it is addressed to, and signed.
+The host only passes it along: it can't read it, change it, or put someone else's name on it. There is nothing to
+set up, because the key each device already has is the one used.
+
+There is no unencrypted mode. A message that wasn't encrypted, or doesn't check out, is never shown; your agent
+gets a note saying so instead.
+
+Keys are handed out by the host, so to be sure nobody sits in the middle, compare the key shown for a friend in
+"who is on the backchannel?" with the one in their `/backchannel:status`. You are told if a friend's key ever
+changes. [SECURITY.md](SECURITY.md) has the details and the limits.
+
+### Updating from 0.6 or earlier
+
+0.7 does not exchange messages with older versions, so everyone needs to update, the host first:
+
+- Through a host older than 0.7, a 0.7 client can't send or read anything, and says so.
+- A member older than 0.7 is told to update when they try to send. You can still write to them; they can read it
+  once they have updated ("show backchannel history").
+- Sessions that were already open keep running the old version until they are restarted.
 
 ## Headless host
 
@@ -114,7 +132,8 @@ uv run --locked --no-dev backchannel serve
 
 Keep it running, or run it under systemd. Everyone, including the host's owner, installs the plugin as a **client**.
 
-The server takes a name of its own (the OS username by default) and nobody reads its inbox. Give it a name no person
+The server takes a name of its own (the OS username by default) and nobody reads its inbox, so nothing is encrypted
+for it: a headless host only ever holds ciphertext. Give it a name no person
 uses, such as `BACKCHANNEL_NAME=relay`; otherwise a client with the same name is refused as "name taken".
 
 Manage pairing from another terminal:
@@ -141,8 +160,9 @@ Don't expose the port to the internet. See [SECURITY.md](SECURITY.md) for what i
 ## Development
 
 A standard Python project: `pyproject.toml`, the package in `src/backchannel/`, tests in `tests/`, dependencies pinned
-in `uv.lock`. The modules are `config` (limits, settings, errors), `crypto` (keys and what gets signed), `store`
-(SQLite), `host` (the relay), `client`, `tools` (what the agent sees) and `cli`.
+in `uv.lock`. The modules are `config` (limits, settings, errors), `crypto` (keys, what gets signed, sealing messages),
+`store` (SQLite), `host` (the relay), `client`, `roster` (whose key is whose), `tools` (what the agent sees) and
+`cli`.
 
 ```bash
 uv run pytest                                      # about a minute
@@ -150,3 +170,6 @@ uv run ruff check . && uv run ruff format --check .
 ```
 
 Test hosts listen on loopback only; set `BACKCHANNEL_BIND=private` to also cover LAN binding, as CI does.
+
+`scripts/` holds a pen test and a load test that are run by hand before a release; past results are in
+[scripts/README.md](scripts/README.md).

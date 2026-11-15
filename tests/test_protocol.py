@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 from harness import hello, respell
 
+from backchannel.config import SEALED_PREFIX
+
 
 def url(relay, path):
     return f"http://127.0.0.1:{relay.port}{path}"
@@ -70,7 +72,7 @@ def test_bodies_that_are_not_what_they_claim_do_not_crash_the_host(relay, tmp_pa
         assert (r.status_code, r.json()["error"]) == (400, "bad_request"), payload
     assert sam.post("history", {"limit": "many"})[0].status_code == 400
     assert sam.post("history", {"limit": 10**30, "with": {"a": 1}})[0].status_code == 200
-    assert sam.post("send", {"to": ["all"], "body": {"x": 1}})[0].status_code == 422  # unknown recipient, as text
+    assert sam.post("send", {"to": ["all"], "body": {"x": 1}})[0].status_code == 422  # refused, as text
     assert sam.post("wait", {"timeout": 0, "after": "x", "sid": {"no": 1}})[0].status_code == 200
     assert sam.post("ack", {"id": "9"})[0].status_code == 200
     assert sam.post("../hello", {})[0].status_code == 405  # normalised to POST /hello, which doesn't exist
@@ -140,7 +142,7 @@ def test_wait_answers_as_soon_as_a_message_is_sent(relay, tmp_path):
         waiting = pool.submit(lambda: (sam.post("wait", {"after": 0, "timeout": 20})[0].json(), time.time()))
         time.sleep(1.5)
         sent = time.time()
-        assert bob.post("send", {"to": "sam", "body": "now"})[0].status_code == 200
+        assert bob.send("sam", "now").status_code == 200
         answer, at = waiting.result(10)
     assert answer["unread"] == 1 and at - sent < 1.0, at - sent
 
@@ -163,13 +165,13 @@ def test_a_removed_member_is_cut_off_mid_wait(relay, tmp_path):
         relay.store.revoke(sam.ident.pub)
         r = waiting.result(10)
     assert (r.status_code, r.json()["error"]) == (403, "declined")
-    assert sam.post("send", {"to": relay.name, "body": "x"})[0].json()["error"] == "declined"
+    assert sam.send(relay.name, "x").json()["error"] == "declined"
 
 
 def test_send_limits(relay, tmp_path):
     sam = relay.member(tmp_path, "sam")
-    assert "too long" in sam.post("send", {"to": relay.name, "body": "x" * 9000})[0].json()["error"]
-    assert "Unknown recipient" in sam.post("send", {"to": "nobody", "body": "x"})[0].json()["error"]
-    assert "empty" in sam.post("send", {"to": relay.name, "body": "  "})[0].json()["error"]
-    codes = [sam.post("send", {"to": relay.name, "body": "x"})[0].status_code for _ in range(22)]
+    assert "too long" in sam.post("send", {"to": relay.name, "body": SEALED_PREFIX + "x" * 25000})[0].json()["error"]
+    assert "Unknown recipient" in sam.send("nobody", "x").json()["error"]
+    assert "needs backchannel 0.7" in sam.post("send", {"to": relay.name, "body": "in the clear"})[0].json()["error"]
+    codes = [sam.send(relay.name, "x").status_code for _ in range(22)]
     assert codes[:20] == [200] * 20 and codes[20:] == [422, 422], codes

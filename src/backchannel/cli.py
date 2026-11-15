@@ -38,7 +38,8 @@ backchannel: pass messages and instructions between friends' AI agents on a priv
 Everyone runs this same program as a local stdio MCP server. One person picks the `host` role: their copy also
 runs a small signed JSON relay (HTTP) and answers UDP discovery broadcasts. `client` copies find the host
 automatically, ask the user to confirm it, ask the host to pair, and sign every request with a per-device Ed25519
-key. Every relay response is signed by the host key the client pinned. MCP itself never goes over the network.
+key. Every relay response is signed by the host key the client pinned. Messages are end-to-end encrypted between
+members, so the host relays and stores only ciphertext. MCP itself never goes over the network.
 
     backchannel           stdio MCP server (role from BACKCHANNEL_ROLE)
     backchannel serve     headless host (e.g. a homelab box)
@@ -48,8 +49,8 @@ key. Every relay response is signed by the host key the client pinned. MCP itsel
 """
 
 
-def make_host(cfg: Config, ident: Identity) -> Host:
-    return Host(ident, Store(cfg.data / "backchannel.db"), cfg.name, cfg.port, cfg.bind)
+def make_host(cfg: Config, ident: Identity, relay: bool = False) -> Host:
+    return Host(ident, Store(cfg.data / "backchannel.db"), cfg.name, cfg.port, cfg.bind, relay)
 
 
 async def heartbeat(cfg: Config, host: Host | None, client: Client | None) -> None:
@@ -235,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
     if not command:
         asyncio.run(run_stdio(cfg, ident))
     elif command == "serve":
-        asyncio.run(make_host(cfg, ident).serve(install_signal_handlers=True))
+        asyncio.run(make_host(cfg, ident, relay=True).serve(install_signal_handlers=True))
     elif command == "wait":
         sys.exit(asyncio.run(wait_host(cfg) if cfg.role == "host" else wait_client(cfg, ident)))
     elif command == "status":

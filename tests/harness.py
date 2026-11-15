@@ -18,7 +18,7 @@ import httpx
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
-from backchannel.crypto import Identity, fingerprint, request_payload
+from backchannel.crypto import Identity, fingerprint, request_payload, seal
 from backchannel.store import Store
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -175,6 +175,11 @@ class Raw:
     def __init__(self, data: Path, port: int):
         data.mkdir(parents=True, exist_ok=True)
         self.ident, self.port = Identity(data / "identity.json"), port
+
+    def send(self, to: str, text: str, readers: tuple[str, ...] = ()):
+        """Send the way a 0.7 client does: sealed for `readers` (public keys)."""
+        body = seal(self.ident, hello(self.port).json()["key"], to, list(readers), text)
+        return self.post("send", {"to": to, "body": body})[0]
 
     def post(
         self,
