@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "backchannel",
   "displayName": "Backchannel",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Pass messages between friends' agents on a private network, and let them talk things through. One friend hosts; everyone else finds them automatically.",
   "author": {
     "name": "iddv",

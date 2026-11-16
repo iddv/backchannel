@@ -6,7 +6,7 @@ import time
 import pytest
 from harness import Identity, Store, respell
 
-from backchannel.config import SESSION_TTL
+from backchannel.config import BROADCAST_TTL, SESSION_TTL
 from backchannel.host import Host
 
 X, Y, S1, S2 = "a" * 12, "b" * 12, "c" * 12, "d" * 12  # two of ann's sessions, two of ben's
@@ -117,10 +117,44 @@ def test_another_session_can_hold_its_own_conversation(chat):
     assert chat.got("ben", S1) == ["more from x"]
 
 
-def test_broadcasts_reach_whichever_session_checks_first(chat):
+def test_a_broadcast_reaches_every_session_once(chat):
+    chat.say("ben", "all", "news", S1)
+    assert chat.store.waiting("ann", sid=X)["unread"] == 1
+    assert chat.got("ann", Y) == ["news"]
+    assert chat.got("ann", Y) == []
+    assert chat.store.waiting("ann", sid=X)["unread"] == 1  # one session reading it doesn't use it up
+    assert chat.got("ann", X) == ["news"]
+    assert chat.got("ann", X) == []
+
+
+def test_a_broadcast_reaches_the_senders_other_sessions_but_not_the_one_that_sent_it(chat):
+    chat.say("ben", "all", "news", S1)
+    assert chat.got("ben", S1) == []
+    assert chat.store.waiting("ben", sid=S1)["unread"] == 0
+    assert chat.got("ben", S2) == ["news"]
+    assert chat.got("ben", S2) == []
+    assert chat.got("ben") == []  # a client without sessions can't tell which of them sent it
+
+
+def test_a_broadcast_stops_being_new_after_a_while(chat):
     chat.say("ben", "all", "news", S1)
     assert chat.got("ann", Y) == ["news"]
-    assert chat.got("ann", X) == []
+    chat.store.db.execute("UPDATE messages SET ts=ts-?", (BROADCAST_TTL + 1,))
+    assert chat.got("ann", X) == []  # ann has read it, and it is old
+    assert chat.got("ben", S2) == []
+    assert chat.got("cat", X) == ["news"]  # nobody under this name has, however old it is
+    assert chat.got("cat", Y) == []
+    chat.say("ben", "all", "more", S1)  # the next young one clears the marks of the old
+    chat.got("ann", Y)
+    assert chat.store.db.execute("SELECT COUNT(*) FROM seen").fetchone()[0] == 1
+
+
+def test_a_held_broadcast_is_marked_for_the_session_that_acknowledges_it(chat):
+    chat.say("ben", "all", "news", S1)
+    assert chat.got("ann", Y, hold=True) == ["news"]
+    chat.store.ack("ann", 10**9, Y)
+    assert chat.got("ann", Y) == []
+    assert chat.got("ann", X) == ["news"]
 
 
 def test_a_client_without_sessions_sees_everything_for_its_name(chat):

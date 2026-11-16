@@ -126,8 +126,12 @@ session, though. When one of your sessions messages sam, the first of sam's sess
 conversation, and from then on replies go only between those two sessions. Another session can start its own
 conversation with sam alongside it.
 
-A message to `all`, or a first message nobody has claimed yet, goes to whichever session checks first, and wakes
-every session that is watching.
+A first message nobody has claimed yet goes to whichever session checks first, and wakes every session that is
+watching.
+
+A message to `all` is not used up by its first reader. For an hour it is shown once to every open session of
+every member, including the sender's other sessions (not the one that sent it). After that it is shown only to
+members who haven't read it in any session. The host decides this, so it needs 0.10 on the host only.
 
 No session ever takes over another's conversation. If a session closes, messages addressed to it stay with it: your
 other sessions are told once that they exist, and "show backchannel history" lists them. The next message its

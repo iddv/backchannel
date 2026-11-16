@@ -18,7 +18,7 @@ from .client import Client, Confirm, can_elicit
 from .config import BCError, Config, log
 from .crypto import Identity, is_sealed, seal
 from .host import Host
-from .messages import checked_rows, clean, fmt_messages, stranded_note
+from .messages import checked_rows, clean, fmt_messages, own_note, stranded_note
 from .net import bind_interfaces
 from .roster import Member, Pins, behind, describe, open_rows, parse_roster, readers
 from .store import Peer, describe_request
@@ -178,7 +178,8 @@ class HostBackend:
         box = await self.host.db(self.host.inbox, self.cfg.name, self.cfg.session)
         rows = await self._open(box["messages"])
         notes += conv_notes(box["conversations"], set(self.talk.open))
-        return "\n\n".join(notes + stranded_note(box["stranded"]) + [fmt_messages(rows, box["more"])])
+        notes += stranded_note(box["stranded"]) + own_note(rows, self.cfg.name)
+        return "\n\n".join([*notes, fmt_messages(rows, box["more"])])
 
     async def history(self, limit: int, with_user: str | None, ctx: Context) -> str:
         rows = await self.host.db(self.host.store.history, self.cfg.name, limit, with_user)
@@ -355,7 +356,8 @@ class ClientBackend:
             notes.insert(0, f"{client.waiting_on} accepted you: you are on the backchannel.")
             client.waiting_on = ""
         notes += conv_notes(r.get("conversations"), set(self.talk.open))
-        return "\n\n".join([*notes, *stranded_note(r.get("stranded")), fmt_messages(rows, more)])
+        notes += stranded_note(r.get("stranded")) + own_note(rows, self.cfg.name)
+        return "\n\n".join([*notes, fmt_messages(rows, more)])
 
     async def history(self, limit: int, with_user: str | None, ctx: Context) -> str:
         r = await self.client.call(ctx, "history", {"limit": limit, "with": with_user})

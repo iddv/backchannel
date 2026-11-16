@@ -10,6 +10,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 from .config import (
+    BROADCAST_TTL,
     CHECK_MAX_BYTES,
     CHECK_MAX_MESSAGES,
     MAX_BODY,
@@ -139,7 +140,14 @@ class Store:
         )
         ex("CREATE INDEX messages_recipient_id ON messages(recipient, id)")
 
-    _MIGRATIONS = (_schema_1, _schema_2, _schema_3)
+    def _schema_4(self) -> None:
+        """0.10: a broadcast is handed to every session, so which session has had which is tracked here."""
+        self.db.execute(
+            "CREATE TABLE seen (user TEXT NOT NULL, sid TEXT NOT NULL, msg_id INTEGER NOT NULL, "
+            "PRIMARY KEY(user, sid, msg_id))"
+        )
+
+    _MIGRATIONS = (_schema_1, _schema_2, _schema_3, _schema_4)
 
     def lock_down(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -284,17 +292,25 @@ class Store:
         return max(r[0] if r else 0, self.joined_id(user))
 
     def _unread(self, user: str, sid: str = "", after: int = 0) -> tuple[str, list]:
-        """WHERE clause for what `user` hasn't read. With a session id, only broadcasts, unclaimed messages and
-        this session's own conversations. Without one (v0.3 clients), everything for the name."""
+        """WHERE clause for what `user` hasn't read. Without a session id (v0.3 clients, and the bookkeeping for
+        the name as a whole): everything for the name that no session has read. With one: unclaimed messages and
+        this session's own, plus every broadcast this session hasn't been handed, for as long as nobody under the
+        name has read it or it is younger than BROADCAST_TTL. That includes broadcasts from the user's other
+        sessions, which are only ever new while they are that young."""
+        cursor = self._cursor(user)
+        mine = "id>? AND sender!=? AND id NOT IN (SELECT msg_id FROM readmarks WHERE user=?)"
+        if not sid:
+            return f"WHERE {mine} AND (recipient=? OR recipient='all')", [max(cursor, after), user, user, user]
         where = (
-            "WHERE id>? AND (recipient=? OR recipient='all') AND sender!=? "
-            "AND id NOT IN (SELECT msg_id FROM readmarks WHERE user=?)"
+            f"WHERE id>? AND (({mine} AND recipient=? AND recipient_sid IN ('',?)) OR ("
+            "recipient='all' AND id NOT IN (SELECT msg_id FROM seen WHERE user=? AND sid=?) AND ("
+            f"({mine}) OR (ts>? AND (sender!=? OR sender_sid NOT IN ('',?))))))"
         )
-        args: list = [max(self._cursor(user), after), user, user, user]
-        if sid:
-            where += " AND (recipient='all' OR recipient_sid IN ('',?))"
-            args.append(sid)
-        return where, args
+        direct = [cursor, user, user]
+        return where, [
+            max(self.joined_id(user), after), *direct, user, sid, user, sid, *direct, time.time() - BROADCAST_TTL,
+            user, sid,
+        ]  # fmt: skip
 
     def stranded(self, user: str, sid: str, note: bool = False) -> dict:
         """Unread messages addressed to a session of `user` that has closed. They are never handed to another
@@ -313,9 +329,22 @@ class Store:
             self.db.executemany("UPDATE messages SET noted=1 WHERE id=?", [(r[0],) for r in rows])
         return {"count": len(rows), "from": sorted({r[1] for r in rows if valid_name(r[1])})[:10]}
 
-    def _mark(self, user: str, ids: list[int]) -> None:
-        """Mark messages read, then move the cursor up to just below the oldest one still unread by anyone."""
+    def _mark(self, user: str, ids: list[int], sid: str = "") -> None:
+        """Mark messages read, then move the cursor up to just below the oldest one still unread by anyone. A
+        broadcast is also marked as handed to this session, since it stays new for the user's other sessions."""
         self.db.executemany("INSERT OR IGNORE INTO readmarks(user,msg_id) VALUES(?,?)", [(user, i) for i in ids])
+        if sid:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO seen(user,sid,msg_id) "
+                "SELECT ?,?,id FROM messages WHERE id=? AND recipient='all'",
+                [(user, sid, i) for i in ids],
+            )
+            # a mark only matters while its broadcast is young enough to be handed out again
+            self.db.execute(
+                "DELETE FROM seen WHERE msg_id<COALESCE("
+                "(SELECT MIN(id) FROM messages WHERE ts>?), (SELECT MAX(id)+1 FROM messages))",
+                (time.time() - BROADCAST_TTL,),
+            )
         where, args = self._unread(user)
         low = self.db.execute(f"SELECT MIN(id) FROM messages {where}", args).fetchone()[0]
         top = self.db.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
@@ -335,7 +364,7 @@ class Store:
         ids = [r[0] for r in self.db.execute(f"SELECT id FROM messages {where} AND id<=?", (*args, upto))]
         if ids:
             with self.tx():
-                self._mark(user, ids)
+                self._mark(user, ids, sid)
 
     def waiting(self, user: str, after: object = 0, sid: str = "") -> dict:
         """What's unread for this session beyond message id `after`, without marking anything read."""
@@ -378,7 +407,7 @@ class Store:
                             (sid, user, m["sender"], ssid, m["id"]),
                         )
             if rows and not hold:
-                self._mark(user, [m["id"] for m in rows])
+                self._mark(user, [m["id"] for m in rows], sid)
         where, args = self._unread(user, sid)  # the cursor may have moved
         total = self.db.execute(f"SELECT COUNT(*) FROM messages {where}", args).fetchone()[0]
         return rows, total - (len(rows) if hold else 0)

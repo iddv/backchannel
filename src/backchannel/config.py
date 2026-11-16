@@ -44,6 +44,7 @@ SCAN_EVERY = 600  # at most one address sweep per process in this many seconds
 REBIND_EVERY = 15  # how often the host looks for changed interfaces / a freed port
 HEARTBEAT = 60  # every session tells the host it is still open this often
 SESSION_TTL = 180  # a session silent for this long is treated as closed
+BROADCAST_TTL = 3600  # a message to "all" stays new for each open session this long, not just the first reader
 SID_RE = re.compile(r"[0-9a-f]{12}")
 CONV_RE = re.compile(r"[0-9a-f]{8}")  # a conversation's id; its messages are addressed to "#<id>"
 CONV_MINUTES = 30  # how long a conversation lasts unless its starter says otherwise

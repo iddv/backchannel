@@ -41,6 +41,13 @@ def fmt_messages(rows: list[dict], more: int = 0, empty: str = "No new messages.
     return "\n\n".join(parts)
 
 
+def own_note(rows: list[dict], me: str) -> list[str]:
+    """A broadcast from another session of the same user arrives under the user's own name; say what it is."""
+    if not any(m["sender"] == me for m in rows):
+        return []
+    return [f"A message from {me} below was sent to everyone by another session of your own user."]
+
+
 def stranded_note(info: object) -> list[str]:
     """Tell the user about messages stuck with a session of theirs that has closed. Validated: it may come from
     the network."""

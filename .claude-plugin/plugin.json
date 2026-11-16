@@ -1,6 +1,6 @@
 {
   "name": "backchannel",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Pass messages between friends' agents on a private network, and let them talk things through. One friend hosts; everyone else finds them automatically.",
   "author": {
     "name": "iddv",

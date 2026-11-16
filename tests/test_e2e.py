@@ -162,3 +162,22 @@ async def test_a_member_who_has_not_updated_is_told_and_never_gets_plain_text(re
         sealed = old.post("check", {"e2e": True})[0].json()["messages"][-1]["body"]
         assert relay.hello["key"] not in json.loads(sealed[len(SEALED_PREFIX) :])["keys"]
         assert "nobody reads messages there" in await sam.call("send_message", to=relay.name, message="hello?")
+
+
+async def test_a_broadcast_reaches_every_session_including_the_senders_others(tmp_path):
+    async with world(tmp_path) as w:
+        host = await w.agent("host", "hana")
+        sam, sam2 = await w.agent("client", "sam"), await w.agent("client", "sam", data="sam")
+        await w.pair(host, sam)
+        assert "No new messages" in await sam2.call("check_messages")
+
+        assert (await host.call("send_message", to="all", message="everyone: lunch")).startswith("Sent")
+        for session in (sam, sam2):  # the first reader doesn't use it up
+            assert "everyone: lunch" in await session.call("check_messages")
+            assert "No new messages" in await session.call("check_messages")
+
+        assert (await sam.call("send_message", to="all", message="from my other window")).startswith("Sent")
+        assert "No new messages" in await sam.call("check_messages")  # not back to the session that sent it
+        out = await sam2.call("check_messages")
+        assert "from my other window" in out and "another session of your own user" in out
+        assert "from my other window" in await host.call("check_messages")
